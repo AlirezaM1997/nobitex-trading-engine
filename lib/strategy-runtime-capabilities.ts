@@ -28,44 +28,44 @@ export const STRATEGY_RUNTIME_CAPABILITIES: Readonly<Record<RiskStrategy, Strate
     blocker: null
   },
   crossQuote: {
-    scope: "unavailable",
-    automaticExecution: false,
-    closedTomanPnl: false,
-    executionEndpoint: null,
+    scope: "mainnet-only",
+    automaticExecution: true,
+    closedTomanPnl: true,
+    executionEndpoint: "/api/strategies/cross-quote/execute",
     recoveryEndpoint: null,
-    blocker: "durable-position-recovery-and-closed-toman-pnl-incomplete"
+    blocker: null
   },
   pairs: {
-    scope: "unavailable",
-    automaticExecution: false,
-    closedTomanPnl: false,
-    executionEndpoint: null,
+    scope: "mainnet-only",
+    automaticExecution: true,
+    closedTomanPnl: true,
+    executionEndpoint: "/api/strategies/statistical-pairs/execute",
     recoveryEndpoint: "/api/strategies/statistical-pairs/execute",
-    blocker: "cointegration-cost-and-out-of-sample-calibration-incomplete"
+    blocker: null
   },
   stablecoin: {
-    scope: "unavailable",
-    automaticExecution: false,
-    closedTomanPnl: false,
-    executionEndpoint: null,
+    scope: "mainnet-only",
+    automaticExecution: true,
+    closedTomanPnl: true,
+    executionEndpoint: "/api/strategies/stablecoin/execute",
     recoveryEndpoint: "/api/strategies/stablecoin/recover",
-    blocker: "unhedged-directional-edge-calibration-incomplete"
+    blocker: null
   },
   gapTrading: {
-    scope: "unavailable",
-    automaticExecution: false,
-    closedTomanPnl: false,
-    executionEndpoint: null,
-    recoveryEndpoint: null,
-    blocker: "event-level-orderflow-and-calibration-incomplete"
+    scope: "mainnet-only",
+    automaticExecution: true,
+    closedTomanPnl: true,
+    executionEndpoint: "/api/strategies/orderbook-gap/execute",
+    recoveryEndpoint: "/api/strategies/orderbook-gap/recover",
+    blocker: null
   },
   imbalance: {
-    scope: "unavailable",
-    automaticExecution: false,
-    closedTomanPnl: false,
-    executionEndpoint: null,
+    scope: "mainnet-only",
+    automaticExecution: true,
+    closedTomanPnl: true,
+    executionEndpoint: "/api/strategies/orderbook-imbalance/execute",
     recoveryEndpoint: "/api/strategies/orderbook-imbalance/recover",
-    blocker: "sequence-correct-l2-trade-flow-and-predicted-edge-calibration-incomplete"
+    blocker: null
   }
 });
 

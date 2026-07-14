@@ -5,16 +5,18 @@ import type { LegQuote } from "@/lib/bot/types";
 import type { MarketOptions, NobitexOrder, OrderBook, Side } from "@/lib/exchanges/types";
 import type { StrategySignal } from "./types";
 import { measureOrderbookImbalance } from "./orderbook-imbalance";
+import { measureAdjacentOrderbookGaps } from "./orderbook-gap";
 
 const BPS = new Decimal(10_000);
 const OFFICIAL_MAINNET_HOSTNAME = "apiv2.nobitex.ir";
 
-export type SpotPositionStrategy = "stablecoin" | "orderbook-imbalance";
-export type SpotPositionRiskStrategy = "stablecoin" | "imbalance";
+export type SpotPositionStrategy = "stablecoin" | "orderbook-gap" | "orderbook-imbalance";
+export type SpotPositionRiskStrategy = "stablecoin" | "gapTrading" | "imbalance";
 export type SpotPositionOrderStage = "entry" | "exit" | "recovery";
 export type SpotPositionExitReason =
   | "convergence"
   | "imbalance-normalized"
+  | "gap-consumed"
   | "take-profit"
   | "stop-loss"
   | "max-loss"
@@ -75,6 +77,14 @@ export type SpotPositionPlanConfig = {
     maxTopLevelSharePercent: Decimal.Value;
     minMicropriceBiasBps: Decimal.Value;
   };
+  gap?: {
+    levels: number;
+    baselineLevels: number;
+    gapIndex: number;
+    minGapBps: Decimal.Value;
+    minGapZScore: Decimal.Value;
+    minGapRatio: Decimal.Value;
+  };
 };
 
 export type SpotPositionExecutionPlan = Readonly<{
@@ -117,6 +127,12 @@ export type SpotPositionExecutionPlan = Readonly<{
     minVisibleDepthToman: Decimal | null;
     maxTopLevelSharePercent: Decimal | null;
     minMicropriceBiasBps: Decimal | null;
+    gapLevels: number | null;
+    gapBaselineLevels: number | null;
+    gapIndex: number | null;
+    minGapBps: Decimal | null;
+    minGapZScore: Decimal | null;
+    minGapRatio: Decimal | null;
   }>;
   createdAt: number;
 }>;
@@ -271,9 +287,9 @@ export function serializeSpotPositionExecutionPlan(plan: SpotPositionExecutionPl
 export function deserializeSpotPositionExecutionPlan(input: unknown): SpotPositionExecutionPlan {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw invalidPlan("Persisted execution plan is missing");
   const value = input as Record<string, unknown>;
-  if (value.version !== 1 || (value.strategy !== "stablecoin" && value.strategy !== "orderbook-imbalance")) throw invalidPlan("Persisted execution plan has an invalid version or strategy");
-  const strategy = value.strategy;
-  const riskStrategy = strategy === "stablecoin" ? "stablecoin" : "imbalance";
+  if (value.version !== 1 || !["stablecoin", "orderbook-gap", "orderbook-imbalance"].includes(String(value.strategy))) throw invalidPlan("Persisted execution plan has an invalid version or strategy");
+  const strategy = value.strategy as SpotPositionStrategy;
+  const riskStrategy = strategy === "stablecoin" ? "stablecoin" : strategy === "orderbook-gap" ? "gapTrading" : "imbalance";
   if (value.riskStrategy !== riskStrategy || value.direction !== "LONG") throw invalidPlan("Persisted execution plan direction is invalid");
   const symbol = requiredString(value.symbol, "symbol").toUpperCase();
   const asset = requiredString(value.asset, "asset").toUpperCase();
@@ -321,10 +337,17 @@ export function deserializeSpotPositionExecutionPlan(input: unknown): SpotPositi
       : null,
     minMicropriceBiasBps: strategy === "orderbook-imbalance"
       ? boundedDecimal(String(c.minMicropriceBiasBps ?? 0), 0, 500, "minMicropriceBiasBps")
-      : null
+      : null,
+    gapLevels: strategy === "orderbook-gap" ? positiveInteger(Number(c.gapLevels), "gapLevels") : null,
+    gapBaselineLevels: strategy === "orderbook-gap" ? positiveInteger(Number(c.gapBaselineLevels), "gapBaselineLevels") : null,
+    gapIndex: strategy === "orderbook-gap" ? nonNegativeInteger(Number(c.gapIndex), "gapIndex") : null,
+    minGapBps: strategy === "orderbook-gap" ? positiveDecimal(String(c.minGapBps), "minGapBps") : null,
+    minGapZScore: strategy === "orderbook-gap" ? positiveDecimal(String(c.minGapZScore), "minGapZScore") : null,
+    minGapRatio: strategy === "orderbook-gap" ? positiveDecimal(String(c.minGapRatio), "minGapRatio") : null
   });
   if (strategy === "stablecoin" && (!config.minDeviationBps || !config.exitDeviationBps)) throw invalidPlan("Persisted Stablecoin exit config is incomplete");
   if (strategy === "orderbook-imbalance" && (!config.imbalanceLevels || !config.imbalanceLevelWeightDecayPercent || !config.minImbalanceRatio || !config.exitImbalanceRatio || !config.minVisibleDepthToman || !config.maxTopLevelSharePercent || !config.minMicropriceBiasBps)) throw invalidPlan("Persisted Imbalance exit config is incomplete");
+  if (strategy === "orderbook-gap" && (config.gapLevels === null || config.gapBaselineLevels === null || config.gapIndex === null || !config.minGapBps || !config.minGapZScore || !config.minGapRatio)) throw invalidPlan("Persisted Gap exit config is incomplete");
   return Object.freeze({
     id: requiredString(value.id, "id"),
     signalId: requiredString(value.signalId, "signalId"),
@@ -350,11 +373,13 @@ export function createSpotPositionExecutionPlan(
 ): SpotPositionExecutionPlan {
   const strategy: SpotPositionStrategy | undefined = signal.kind === "stablecoin"
     ? "stablecoin"
+    : signal.kind === "orderbook-gap"
+      ? "orderbook-gap"
     : signal.kind === "orderbook-imbalance"
       ? "orderbook-imbalance"
       : undefined;
   if (!strategy || signal.status !== "actionable") {
-    throw invalidPlan("Only an actionable Stablecoin or Orderbook Imbalance signal can become a position plan");
+    throw invalidPlan("Only an actionable Stablecoin, Orderbook Gap or Orderbook Imbalance signal can become a position plan");
   }
   if (signal.metrics.direction !== "LONG" || signal.metrics.spotExecutable !== true) {
     throw invalidPlan("The signal is not an IRT-funded long Spot position");
@@ -366,6 +391,14 @@ export function createSpotPositionExecutionPlan(
     || signal.metrics.executionDepthSafe !== true
   )) {
     throw invalidPlan("The imbalance signal is missing temporal, spoofing, price, or execution-depth confirmation");
+  }
+  if (strategy === "orderbook-gap" && (
+    signal.metrics.analyticalSetupPassed !== true
+    || signal.metrics.liveSetupPassed !== true
+    || signal.metrics.outcomeCalibrated !== true
+    || signal.metrics.temporalConfirmed !== true
+  )) {
+    throw invalidPlan("The gap signal is missing analytical, temporal, or forward-outcome confirmation");
   }
   const symbol = String(signal.symbols[0] ?? "").toUpperCase();
   if (!symbol.endsWith("IRT") || symbol.length <= 3) throw invalidPlan("The position market must be an asset/IRT Spot market");
@@ -385,8 +418,10 @@ export function createSpotPositionExecutionPlan(
 
   const stablecoin = strategy === "stablecoin" ? input.stablecoin : undefined;
   const imbalance = strategy === "orderbook-imbalance" ? input.imbalance : undefined;
+  const gap = strategy === "orderbook-gap" ? input.gap : undefined;
   if (strategy === "stablecoin" && !stablecoin) throw invalidPlan("Stablecoin exit settings are missing");
   if (strategy === "orderbook-imbalance" && !imbalance) throw invalidPlan("Imbalance exit settings are missing");
+  if (strategy === "orderbook-gap" && !gap) throw invalidPlan("Gap exit settings are missing");
 
   const minDeviationBps = stablecoin ? boundedDecimal(stablecoin.minDeviationBps, 0, 10_000, "minDeviationBps") : null;
   const exitDeviationBps = stablecoin ? boundedDecimal(stablecoin.exitDeviationBps, 0, 10_000, "exitDeviationBps") : null;
@@ -399,7 +434,11 @@ export function createSpotPositionExecutionPlan(
     throw invalidPlan("exitRatio must be below minRatio");
   }
 
-  const initialMetricRaw = strategy === "stablecoin" ? signal.metrics.deviationBps : signal.metrics.ratio;
+  const initialMetricRaw = strategy === "stablecoin"
+    ? signal.metrics.deviationBps
+    : strategy === "orderbook-gap"
+      ? signal.metrics.gapBps
+      : signal.metrics.ratio;
   if (typeof initialMetricRaw !== "number" && typeof initialMetricRaw !== "string") throw invalidPlan("Signal metric is missing");
   const route = Object.freeze([symbol, ...(strategy === "stablecoin" ? ["USDTIRT"] : [])]);
   const config = Object.freeze({
@@ -429,7 +468,13 @@ export function createSpotPositionExecutionPlan(
     exitImbalanceRatio,
     minVisibleDepthToman: imbalance ? positiveDecimal(imbalance.minVisibleDepthToman, "minVisibleDepthToman") : null,
     maxTopLevelSharePercent: imbalance ? boundedDecimal(imbalance.maxTopLevelSharePercent, 10, 100, "maxTopLevelSharePercent") : null,
-    minMicropriceBiasBps: imbalance ? boundedDecimal(imbalance.minMicropriceBiasBps, 0, 500, "minMicropriceBiasBps") : null
+    minMicropriceBiasBps: imbalance ? boundedDecimal(imbalance.minMicropriceBiasBps, 0, 500, "minMicropriceBiasBps") : null,
+    gapLevels: gap ? positiveInteger(gap.levels, "gap levels") : null,
+    gapBaselineLevels: gap ? positiveInteger(gap.baselineLevels, "gap baseline levels") : null,
+    gapIndex: gap ? nonNegativeInteger(gap.gapIndex, "gap index") : null,
+    minGapBps: gap ? positiveDecimal(gap.minGapBps, "minGapBps") : null,
+    minGapZScore: gap ? positiveDecimal(gap.minGapZScore, "minGapZScore") : null,
+    minGapRatio: gap ? positiveDecimal(gap.minGapRatio, "minGapRatio") : null
   });
 
   return Object.freeze({
@@ -437,7 +482,7 @@ export function createSpotPositionExecutionPlan(
     signalId: signal.id,
     signalScannedAt: signal.scannedAt,
     strategy,
-    riskStrategy: strategy === "stablecoin" ? "stablecoin" : "imbalance",
+    riskStrategy: strategy === "stablecoin" ? "stablecoin" : strategy === "orderbook-gap" ? "gapTrading" : "imbalance",
     symbol,
     asset,
     referenceSymbol: strategy === "stablecoin" ? "USDTIRT" : null,
@@ -475,7 +520,7 @@ export function revalidateSpotPositionEntry(
     if (expectedNetEdgeBps.lt(required)) {
       throw revalidationError(`Fresh stablecoin edge ${expectedNetEdgeBps.toFixed(2)} BPS is below ${required.toFixed(2)} BPS`);
     }
-  } else {
+  } else if (plan.strategy === "orderbook-imbalance") {
     const imbalance = orderbookImbalance(book, plan.config.imbalanceLevels!, plan.config.imbalanceLevelWeightDecayPercent!);
     metric = imbalance.ratio;
     if (!imbalance.bidHeavy || metric.lt(plan.config.minImbalanceRatio!)) {
@@ -489,6 +534,15 @@ export function revalidateSpotPositionEntry(
     }
     if (imbalance.micropriceBiasBps.lt(plan.config.minMicropriceBiasBps!)) {
       throw revalidationError("Fresh microprice no longer confirms upward pressure");
+    }
+  } else {
+    const gap = currentAskGap(book, plan);
+    metric = gap.gapBps;
+    if (gap.index !== plan.config.gapIndex
+      || gap.gapBps.lt(plan.config.minGapBps!)
+      || gap.robustZScore.lt(plan.config.minGapZScore!)
+      || gap.gapBps.div(Decimal.max(gap.medianGapBps, "0.01")).lt(plan.config.minGapRatio!)) {
+      throw revalidationError("The calibrated ask-side liquidity gap no longer exists at the planned levels");
     }
   }
   return { checkedAt: now, entryQuote, metric, expectedNetEdgeBps };
@@ -666,10 +720,23 @@ async function makeExitCheck(
     assertFresh(reference, now, plan.config.maxAgeMs);
     metric = stablecoinDeviation(book, reference);
     if (metric.abs().lte(plan.config.exitDeviationBps!)) strategyExit = "convergence";
-  } else {
+  } else if (plan.strategy === "orderbook-imbalance") {
     const imbalance = orderbookImbalance(book, plan.config.imbalanceLevels!, plan.config.imbalanceLevelWeightDecayPercent!);
     metric = imbalance.ratio;
     if (!imbalance.bidHeavy || metric.lte(plan.config.exitImbalanceRatio!)) strategyExit = "imbalance-normalized";
+  } else {
+    try {
+      const gap = currentAskGap(book, plan);
+      metric = gap.gapBps;
+      const ratio = gap.gapBps.div(Decimal.max(gap.medianGapBps, "0.01"));
+      if (gap.index !== plan.config.gapIndex
+        || gap.gapBps.lt(plan.config.minGapBps!)
+        || gap.robustZScore.lt(plan.config.minGapZScore!)
+        || ratio.lt(plan.config.minGapRatio!)) strategyExit = "gap-consumed";
+    } catch {
+      metric = new Decimal(0);
+      strategyExit = "gap-consumed";
+    }
   }
   const exitReason = forcedReason
     ?? (pnl.lte(plan.config.maxLossToman.neg()) ? "max-loss" : undefined)
@@ -891,6 +958,19 @@ function orderbookImbalance(book: OrderBook, levels: number, levelWeightDecayPer
     return measureOrderbookImbalance(book, levels, levelWeightDecayPercent);
   } catch (error) {
     throw revalidationError(error instanceof Error ? error.message : "Orderbook imbalance could not be measured");
+  }
+}
+
+function currentAskGap(book: OrderBook, plan: SpotPositionExecutionPlan) {
+  try {
+    return measureAdjacentOrderbookGaps(
+      book,
+      "ASK",
+      plan.config.gapLevels!,
+      plan.config.gapBaselineLevels!
+    ).candidate;
+  } catch (error) {
+    throw revalidationError(error instanceof Error ? error.message : "Orderbook gap could not be measured");
   }
 }
 

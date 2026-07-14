@@ -164,14 +164,16 @@ function dependencies(overrides: Partial<CrossQuoteRouteDependencies> = {}) {
 }
 
 function finalizedLeg(
-  stage: "leg1" | "leg2",
+  stage: "leg1" | "leg2" | "leg3",
   symbol: string,
   side: "BUY" | "SELL",
   orderId: string,
   clientOrderId: string,
   input: Decimal.Value,
   output: Decimal.Value,
-  fee: Decimal.Value
+  fee: Decimal.Value,
+  inputAsset = side === "BUY" ? "IRT" : "X",
+  outputAsset = side === "BUY" ? "X" : "USDT"
 ): CrossQuoteExecutionLeg {
   return {
     stage, symbol, side, orderId, clientOrderId, status: "Done",
@@ -179,11 +181,11 @@ function finalizedLeg(
     matchedAmountBase: side === "BUY" ? new Decimal(100) : new Decimal("99.75"),
     unmatchedAmountBase: new Decimal(0),
     actualInput: new Decimal(input),
-    inputAsset: side === "BUY" ? "IRT" : "X",
+    inputAsset,
     actualOutput: new Decimal(output),
-    outputAsset: side === "BUY" ? "X" : "USDT",
+    outputAsset,
     fee: new Decimal(fee),
-    feeAsset: side === "BUY" ? "X" : "USDT",
+    feeAsset: outputAsset,
     averagePrice: new Decimal(side === "BUY" ? 1_000 : 11),
     fullFill: true
   };
@@ -237,24 +239,35 @@ describe("Cross-Quote execution route", () => {
         const secondRequest: CrossQuoteOrderRequest = {
           side: "SELL", base: "X", quote: "USDT", amountBase: new Decimal("99.75"), expectedPrice: new Decimal(11), clientOrderId: "cq-client-2"
         };
+        const thirdRequest: CrossQuoteOrderRequest = {
+          side: "SELL", base: "USDT", quote: "IRT", amountBase: new Decimal("1095.823575"), expectedPrice: new Decimal(99), clientOrderId: "cq-client-3"
+        };
         const firstOrder = order("exchange-1", 100, 1_000_000, "0.25");
         const secondOrder = order("exchange-2", "99.75", "1097.25", "1.426425");
+        const thirdOrder = order("exchange-3", "1095.823575", "1084865.33925", "2712.163348125");
         const firstLeg = finalizedLeg("leg1", "XIRT", "BUY", firstOrder.id, firstRequest.clientOrderId, 100_000, "99.75", "0.25");
         const secondLeg = finalizedLeg("leg2", "XUSDT", "SELL", secondOrder.id, secondRequest.clientOrderId, "99.75", "1095.823575", "1.426425");
+        const thirdLeg = finalizedLeg("leg3", "USDTIRT", "SELL", thirdOrder.id, thirdRequest.clientOrderId, "1095.823575", "108215.3175901875", "271.2163348125", "USDT", "IRT");
         await hooks.onBeforeOrder?.({ stage: "leg1", plan, quote: validation.legs[0], request: firstRequest });
         await hooks.onOrderSubmitted?.({ stage: "leg1", plan, order: firstOrder, request: firstRequest });
         await hooks.onOrderFinalized?.({ stage: "leg1", plan, leg: firstLeg });
         await hooks.onBeforeOrder?.({ stage: "leg2", plan, quote: validation.legs[1], request: secondRequest });
         await hooks.onOrderSubmitted?.({ stage: "leg2", plan, order: secondOrder, request: secondRequest });
         await hooks.onOrderFinalized?.({ stage: "leg2", plan, leg: secondLeg });
+        const thirdQuote = quoteEdge({ id: "USDTIRT:SELL", from: "USDT", to: "IRT", side: "SELL", book: marketBooks[0]! }, secondLeg.actualOutput, 25, 0, 100)!;
+        await hooks.onBeforeOrder?.({ stage: "leg3", plan, quote: thirdQuote, request: thirdRequest });
+        await hooks.onOrderSubmitted?.({ stage: "leg3", plan, order: thirdOrder, request: thirdRequest });
+        await hooks.onOrderFinalized?.({ stage: "leg3", plan, leg: thirdLeg });
         return {
           status: "completed",
           plan,
           entry: validation,
-          legs: [firstLeg, secondLeg],
-          finalAsset: "USDT",
-          finalOutput: secondLeg.actualOutput,
+          legs: [firstLeg, secondLeg, thirdLeg],
+          finalAsset: "IRT",
+          finalOutput: thirdLeg.actualOutput,
+          actualInputToman: new Decimal(100_000),
           residualAssetAmount: new Decimal(0),
+          fullySettled: true,
           actualEdgeBps: new Decimal(985)
         };
       }
@@ -263,7 +276,7 @@ describe("Cross-Quote execution route", () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ status: "completed", executionId: 7, pnlRecorded: false });
     expect(transitions).toEqual(["REVALIDATING", "SUBMITTING", "CLOSED"]);
-    expect(storedOrders).toHaveLength(6);
+    expect(storedOrders).toHaveLength(9);
     expect(storedOrders.some(value => value.clientOrderId === "cq-client-1" && value.exchangeOrderId === "exchange-1")).toBe(true);
     expect(storedOrders.some(value => value.clientOrderId === "cq-client-2" && value.exchangeOrderId === "exchange-2")).toBe(true);
     expect(released).toBe(1);
@@ -348,7 +361,9 @@ describe("Cross-Quote execution route", () => {
           legs: [],
           finalAsset: "IRT",
           finalOutput: new Decimal(99_000),
+          actualInputToman: new Decimal(100_000),
           residualAssetAmount: new Decimal(0),
+          fullySettled: true,
           recoveryReason: "emergency-stop-active"
         };
       }
@@ -359,7 +374,7 @@ describe("Cross-Quote execution route", () => {
     expect(riskChecks).toBe(2);
     expect(renewals).toBe(3);
     expect(transitions).toEqual(["REVALIDATING", "SUBMITTING", "RECOVERING", "CLOSED"]);
-    expect(emergencyCalls).toBe(0);
+    expect(emergencyCalls).toBe(1);
   });
 
   test("validates execution-history query filters before touching the database", async () => {

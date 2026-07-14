@@ -22,8 +22,23 @@ describe("strategy settings migration", () => {
     expect(parsed.gapTrading.safetyBufferBps).toBe(45);
   });
 
-  test("does not overwrite an explicit Gap Trading configuration", () => {
-    const source = { gapTrading: { enabled: true, capitalToman: 123_000 }, marketMaking: { enabled: true } };
+  test("upgrades an old Gap Trading window while preserving explicit values", () => {
+    const migrated = migrateStoredStrategyLabSettings({
+      gapTrading: { enabled: true, capitalToman: 123_000, sampleWindowMs: 20_000, maxPersistenceMs: 15_000 }
+    });
+    const parsed = strategyLabSettingsSchema.parse(migrated);
+    expect(parsed.gapTrading.enabled).toBe(true);
+    expect(parsed.gapTrading.capitalToman).toBe(123_000);
+    expect(parsed.gapTrading.sampleWindowMs).toBe(60_000);
+    expect(parsed.gapTrading.maxPersistenceMs).toBe(45_000);
+    expect(parsed.gapTrading.minOutcomeSamples).toBe(20);
+  });
+
+  test("does not overwrite a calibrated Gap Trading configuration", () => {
+    const source = {
+      gapTrading: { ...strategyLabSettingsSchema.parse({}).gapTrading, enabled: true, capitalToman: 123_000 },
+      marketMaking: { enabled: true }
+    };
     expect(migrateStoredStrategyLabSettings(source)).toBe(source);
   });
 });

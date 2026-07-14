@@ -100,7 +100,7 @@ describe("strategy lab", () => {
     ], { ...config, settings }, now);
     expect(signals[0]?.status).toBe("watch");
     expect(signals[0]?.metrics.executionDepthSafe).toBe(false);
-    expect(signals[0]?.reasons[0]).toContain("عمق");
+    expect(signals[0]?.reasons[0]).toContain("depth");
   });
 
   test("measures adjacent price gaps with a robust median/MAD baseline", () => {
@@ -115,7 +115,7 @@ describe("strategy lab", () => {
     expect(measured.candidate.robustZScore.gt(3)).toBe(true);
   });
 
-  test("keeps a fully gated persistent ask gap in Shadow watch and never marks it executable", () => {
+  test("keeps a persistent ask gap on watch until forward outcomes are calibrated", () => {
     const gapBook: OrderBook = {
       symbol: "XIRT", base: "X", quote: "IRT", lastUpdate: now,
       bids: [99, 98.99, 98.98, 98.97, 98.96].map(price => ({ price: new Decimal(price), amount: new Decimal(10_000) })),
@@ -153,7 +153,7 @@ describe("strategy lab", () => {
     expect(signal?.status).toBe("watch");
     expect(signal?.metrics.analyticalSetupPassed).toBe(true);
     expect(signal?.metrics.spotExecutable).toBe(false);
-    expect(signal?.metrics.liveBlocker).toBe("event-level-orderflow-and-calibration-incomplete");
+    expect(signal?.metrics.liveBlocker).toBe("forward-outcome-calibration-incomplete");
   });
 
   test("blocks a bid-side liquidity gap because Spot cannot short it", () => {
@@ -174,7 +174,7 @@ describe("strategy lab", () => {
     const signals = scanOrderbookImbalance([book("XIRT", "X", "IRT", 99, 101, 1_000, 100)], { ...config, settings }, now);
     expect(signals[0]?.status).toBe("actionable");
     expect(signals[0]?.estimatedNetProfitToman.toString()).toBe("0");
-    expect(signals[0]?.reasons.some(reason => reason.includes("تضمین"))).toBe(true);
+    expect(signals[0]?.reasons.some(reason => reason.includes("not guaranteed"))).toBe(true);
   });
 
   test("keeps an otherwise valid imbalance on watch when round-trip friction consumes Stop Loss", () => {
@@ -204,7 +204,7 @@ describe("strategy lab", () => {
 
     expect(signal?.status).toBe("watch");
     expect(signal?.metrics.roundTripRiskPassed).toBe(false);
-    expect(signal?.reasons[0]).toContain("هزینه رفت‌وبرگشت");
+    expect(signal?.reasons[0]).toContain("round-trip cost");
   });
 
   test("keeps a one-snapshot imbalance on watch instead of trading a transient wall", () => {
@@ -217,7 +217,7 @@ describe("strategy lab", () => {
     ]))[0];
     expect(signal?.status).toBe("watch");
     expect(signal?.metrics.confirmations).toBe(1);
-    expect(signal?.reasons[0]).toContain("تداوم کافی");
+    expect(signal?.reasons[0]).toContain("Persistence");
   });
 
   test("accepts persistent multi-level pressure only after a measurable change point", () => {

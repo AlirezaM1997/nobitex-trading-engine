@@ -11,14 +11,14 @@
 
 | موتور | دامنه اجرای سفارش | خودکار | پایان با PnL تومانی بسته | وضعیت فعلی |
 |---|---|---:|---:|---|
-| Triangular Arbitrage | فقط API رسمی نوبیتکس و Production | بله | بله/با Dust مشخص | تنها موتور مجاز برای ورود Live؛ تابع کلید موتور، Master، Live Owner و محدودیت‌های Risk Center |
-| Statistical Pairs | Shadow / ورود قفل | خیر | خیر | مدل Cointegration، هزینه و اعتبارسنجی خارج از نمونه هنوز به کالیبراسیون واقعی نیاز دارد؛ Recovery رکوردهای قدیمی حفظ شده است |
-| Stablecoin Convergence | Shadow / ورود قفل | خیر | خیر | ریسک Depeg و زمان همگرایی Long-only هنوز با داده واقعی کالیبره نشده است؛ Recovery رکوردهای قدیمی حفظ شده است |
-| Orderbook Imbalance | Shadow / ورود قفل | خیر | خیر | فید REST برای L2 sequence-correct و Trade Flow کافی نیست؛ ورود واقعی تا کالیبراسیون Out-of-sample مسدود است |
-| Cross-Quote Inventory | قفل‌شده | خیر | خیر | کد پایه اجرای Mainnet وجود دارد، اما Position State و Recovery پایدار پس از Restart و چرخه بسته‌ی PnL تومانی کامل نیست |
-| Orderbook Gap / Liquidity Vacuum | Shadow/Paper | خیر | خیر | تحلیل Spot فعال است؛ Live تا تکمیل WebSocket رویدادمحور، OFI/Trade Flow و کالیبراسیون fail-closed است. OTC اردربوک عمومی و API رسمی قابل اتکا ندارد |
+| Triangular Arbitrage | فقط API رسمی نوبیتکس و Production | بله | بله/با Dust مشخص | چرخه سه‌سفارشی IRT با بازاعتبارسنجی و Recovery |
+| Statistical Pairs | فقط API رسمی نوبیتکس و Production | بله | بله | Spot Long و Margin Short با ثبت پوزیشن، خروج و Recovery |
+| Stablecoin Convergence | فقط API رسمی نوبیتکس و Production | بله | بله | اجرای Long-only اسپات پس از کنترل عمق، هزینه و همگرایی |
+| Orderbook Imbalance | فقط API رسمی نوبیتکس و Production | بله | بله | اجرای Long-only اسپات فقط پس از کالیبراسیون Forward Outcome |
+| Cross-Quote Arbitrage | فقط API رسمی نوبیتکس و Production | بله | بله | چرخه بسته سه‌سفارشی IRT→Asset/USDT→IRT با لجر موجودی و Recovery |
+| Orderbook Gap / Liquidity Vacuum | Spot رسمی نوبیتکس و Production | بله | بله | اجرای Long-only اسپات فقط پس از کالیبراسیون Forward Outcome؛ OTC همچنان پشتیبانی نمی‌شود |
 
-در نسخه فعلی فقط Triangle اجازه شروع سفارش واقعی دارد. موتورهای دیگر سیگنال و تحلیل تولید می‌کنند، اما حتی اگر کلید اسکن آن‌ها روشن باشد، Risk Control برای ورود جدید Fail-Closed است. محدودیت دامنه، Production، سرمایه و ریسک در سمت سرور اعمال می‌شود و از رابط کاربری قابل دورزدن نیست.
+هر شش موتور مسیر اجرای واقعی سمت سرور دارند. روشن‌کردن موتور به‌تنهایی سفارش ایجاد نمی‌کند؛ سیگنال باید همه فیلترهای اختصاصی، کالیبراسیون، نقدشوندگی و کنترل ریسک را پاس کند. محدودیت دامنه، Production، سرمایه و ریسک در سمت سرور اعمال می‌شود و از رابط کاربری قابل دورزدن نیست.
 
 ## مرکز واحد کنترل اجرای واقعی
 
@@ -45,7 +45,7 @@
 - موتور یا Master خاموش است؛
 - Position State، Recovery یا Execution Adapter ناقص است؛
 - برنامه به دامنه‌ای غیر از Mainnet رسمی متصل است؛
-- اجرای موتور عمداً unavailable است، مانند Orderbook Gap پیش از تکمیل feed رویدادمحور و کالیبراسیون؛
+- سیگنال هنوز کالیبراسیون، نقدشوندگی یا حداقل بازده همان موتور را پاس نکرده است؛
 - Emergency Stop، سقف زیان روزانه یا ظرفیت هم‌زمان مانع اجرا شده است.
 
 ## رفتار هر موتور
@@ -63,48 +63,48 @@
 - پیش از هر درخواست ثبت سفارش، `clientOrderId` و رویداد `SUBMITTING` در لجر immutable نوشته می‌شود؛ شکست این ثبت مانع ارسال سفارش است.
 - در Startup، اجرای نیمه‌تمام هرگز خودکار تکرار نمی‌شود؛ شواهد سفارش باعث Emergency Stop و `MANUAL_REVIEW` می‌شوند.
 
-### Statistical Pairs — Shadow / ورود جدید قفل
+### Statistical Pairs
 
 - رابطه تاریخی دو دارایی با OHLC، OLS Beta و Z-Score بررسی می‌شود.
-- مدل سیگنال شامل Spot Long و Margin Short با Hedge Ratio است، اما ورود جدید فعلاً مسدود است.
+- مدل سیگنال شامل Spot Long و Margin Short با Hedge Ratio است و فقط پس از تأیید مدل و کنترل ریسک وارد اجرای واقعی می‌شود.
 - Beta مثبت، حداقل Correlation، ADF/نیمه‌عمر Residual، Holdout Drift و هزینه رفت‌وبرگشت باید هم‌زمان پاس شوند.
 - اسپرد/اثر قیمت ورود، تحمل خطای Hedge، Beta Drift، Margin Ratio، فاصله تا Liquidation، Stop Z-Score و Max Holding قابل تنظیم‌اند.
 - Supervisor خروج آماری و وضعیت Margin را مانیتور می‌کند و در Fill نامتقارن یا Restart، Position State ذخیره‌شده را تطبیق می‌دهد.
 
-### Stablecoin Convergence — Shadow / ورود جدید قفل
+### Stablecoin Convergence
 
 - انحراف USDC/DAI و دارایی‌های تنظیم‌شده از مرجع بررسی می‌شود.
 - فقط مسیر Spot Long از IRT پشتیبانی می‌شود؛ سیگنال Short ساختگی اجرا نمی‌شود.
 - سیگنال با عمق واقعی ورود و خروج، Spread، Price Impact، کارمزد، لغزش و خروج فرضی در Parity سنجیده می‌شود.
 - خروج موفق به IRT برمی‌گردد و PnL بسته تومانی ثبت می‌شود.
-- تا کالیبراسیون Depeg، زمان همگرایی و بازده خارج از نمونه، آداپتر ورود از Risk Control مجوز نمی‌گیرد.
+- تا عبور انحراف، زمان همگرایی، نقدشوندگی و بازده خالص از آستانه‌های تنظیم‌شده، ورود واقعی انجام نمی‌شود.
 
-### Orderbook Imbalance — Shadow / ورود جدید قفل
+### Orderbook Imbalance
 
 - نسبت حجم Bid/Ask در چند سطح اردربوک، عمق قابل اتکا و اسپرد سنجیده می‌شود.
 - فقط سیگنال Spot قابل اجرا وارد پوزیشن می‌شود.
 - تداوم Snapshotهای واقعاً جدید، Change Point، Microprice، تمرکز Level اول، پاسخ قیمت و هزینه رفت‌وبرگشت کنترل می‌شوند.
-- پیش‌بینی فقط پس از حداقل نمونه نتیجه، Hit Rate و بازده محافظه‌کارانه خالص معتبر می‌شود؛ تا آن زمان Edge برابر صفر و وضعیت Shadow است.
+- پیش‌بینی فقط پس از حداقل نمونه نتیجه، Hit Rate و بازده محافظه‌کارانه خالص معتبر می‌شود؛ تا آن زمان سیگنال روی حالت پایش می‌ماند و سفارش ارسال نمی‌شود.
 - خروج و Recovery فقط باقی‌مانده‌ی تأییدشده‌ی همان اجرا را به IRT می‌فروشند تا Double Sell رخ ندهد.
 
-### Cross-Quote Inventory — قفل
+### Cross-Quote Arbitrage
 
-این مدل اختلاف قیمت یک دارایی در بازار IRT و USDT را می‌سنجد، اما ضلع دوم ممکن است با USDT تمام شود. بنابراین چرخه لزوماً PnL بسته تومانی ندارد و برای تکرار به مدیریت موجودی دوطرفه نیاز دارد. تا زمانی که Position State پایدار، Recovery پس از Restart و بازتراز Inventory تکمیل نشوند، Risk Center آن را Fail-Closed نگه می‌دارد.
+این مدل اختلاف قیمت یک دارایی در بازار IRT و USDT را می‌سنجد و جهت برنده را به چرخه بسته سه‌سفارشی تبدیل می‌کند. سرمایه با IRT شروع می‌شود، ضلع USDT/IRT تسویه نهایی را انجام می‌دهد و فقط نتیجه‌ای که بسته‌شدن موجودی غیرتومانی آن اثبات شده باشد به‌عنوان PnL قطعی ثبت می‌شود. وضعیت مبهم سفارش یا باقی‌مانده تأییدنشده، اجرای جدید را Fail-Closed و نیازمند بررسی می‌کند.
 
-### Orderbook Gap / Liquidity Vacuum — Shadow
+### Orderbook Gap / Liquidity Vacuum
 
 - این موتور جایگزین Market Making شده و فاصله‌های غیرعادی میان Levelهای نزدیک قیمت، Median/MAD، ماندگاری چند Snapshot، Bid Support، Microprice، تمرکز نقدینگی، Spread، Price Impact و هزینه رفت‌وبرگشت را بررسی می‌کند.
 - Gap به‌تنهایی آربیتراژ یا سود تضمین‌شده نیست؛ فقط شکنندگی دفتر سفارش را نشان می‌دهد. سیگنال نزولی در Spot بدون Short صرفاً هشدار است.
-- نسخه فعلی هیچ سفارش واقعی ارسال نمی‌کند. اسکن REST یک‌ثانیه‌ای برای OFI، Trade Flow، عمر سفارش و لغوهای لحظه‌ای کافی نیست؛ Live فقط پس از WebSocket sequence-correct، replay/walk-forward، Shadow calibration و اتصال کامل Position/Recovery قابل بررسی است.
+- ورود واقعی فقط برای Ask Gap صعودی اسپات و پس از حداقل نمونه Forward Outcome، Hit Rate، بازده محافظه‌کارانه، ماندگاری Gap، عمق، اثر قیمت و هزینه رفت‌وبرگشت مجاز است. خروج با مصرف‌شدن Gap، Take Profit، Stop Loss یا Max Hold انجام می‌شود و Recovery باقی‌مانده را به IRT برمی‌گرداند.
 - OTC نوبیتکس اردربوک عمومی ندارد و API رسمی فعلی قرارداد قابل اتکایی برای firm quote و execution ارائه نمی‌کند، بنابراین OTC نیز fail-closed است.
 - طراحی و فرمول‌ها در [docs/orderbook-gap-strategy.md](docs/orderbook-gap-strategy.md) ثبت شده‌اند.
 
 ## اسکن، اجرای خودکار و Supervisor
 
 - فاصله اسکن از داشبورد تنظیم می‌شود و حداقل آن `1000 ms` است.
-- مرورگر فقط نمایش، اسکن Paper و کنترل تنظیمات را انجام می‌دهد و هماهنگ‌کننده سفارش Live نیست.
-- Scheduler یکتای سمت سرور در Production هر بار فاصله اسکن را از تنظیمات می‌خواند و فقط Triangle را پس از Master، Risk، Live Owner، Lease و بازاعتبارسنجی تازه اجرا می‌کند.
-- بستن داشبورد اجرای Scheduler را متوقف نمی‌کند؛ خاموش‌کردن Master یا موتور Triangle آن را از شروع چرخه جدید بازمی‌دارد.
+- مرورگر فقط نمایش و کنترل تنظیمات را انجام می‌دهد و هماهنگ‌کننده سفارش Live نیست.
+- Scheduler یکتای سمت سرور در Production هر بار فاصله اسکن را از تنظیمات می‌خواند؛ ابتدا Triangle و سپس بهترین سیگنال قابل اجرای موتورهای فعال را پس از Master، Risk، Live Owner، Lease و بازاعتبارسنجی تازه بررسی می‌کند.
+- بستن داشبورد اجرای Scheduler را متوقف نمی‌کند؛ خاموش‌کردن Master یا کلید اختصاصی هر موتور، شروع اجرای جدید همان موتور را متوقف می‌کند.
 - یک Supervisor سمت Node هر ۵ ثانیه فقط Positionهای پایدار غیرTriangle موجود را بررسی می‌کند. این پردازش حتی با بسته‌شدن مرورگر و خاموش‌بودن Master می‌تواند Recovery کاهنده ریسک را ادامه دهد، اما هرگز پوزیشن جدید باز نمی‌کند.
 - Scheduler و Supervisor در Development، Test و مرحله `next build` غیرفعال‌اند.
 - قفل رکورد با PID و نسل مالک، takeover ایمن پس از مرگ پردازش را ممکن و اجرای هم‌زمان/Double Close را محدود می‌کند.

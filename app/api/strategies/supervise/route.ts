@@ -8,6 +8,8 @@ import {
   type SpotPositionRouteKind
 } from "@/lib/strategies/spot-position-route";
 import { POST as supervisePairs } from "@/app/api/strategies/statistical-pairs/execute/route";
+import { emergencyStopRiskControl } from "@/lib/risk/store";
+import { acquireStrategyExecutionRecordLock, releaseStrategyExecutionRecordLock } from "@/lib/strategy-execution-lock";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -17,6 +19,9 @@ type SupervisorDependencies = {
   listExecutions: typeof listStrategyExecutions;
   monitorPairs(request: Request): Promise<Response>;
   recoverSpot(request: Request, kind: SpotPositionRouteKind): Promise<Response>;
+  acquireRecordLock?: typeof acquireStrategyExecutionRecordLock;
+  releaseRecordLock?: typeof releaseStrategyExecutionRecordLock;
+  emergencyStop?: typeof emergencyStopRiskControl;
 };
 
 type SupervisorRuntime = {
@@ -34,7 +39,10 @@ const defaultDependencies: SupervisorDependencies = {
   },
   listExecutions: listStrategyExecutions,
   monitorPairs: supervisePairs,
-  recoverSpot: (request, kind) => handleSpotPositionRecoveryRequest(request, kind)
+  recoverSpot: (request, kind) => handleSpotPositionRecoveryRequest(request, kind),
+  acquireRecordLock: acquireStrategyExecutionRecordLock,
+  releaseRecordLock: releaseStrategyExecutionRecordLock,
+  emergencyStop: emergencyStopRiskControl
 };
 
 export async function POST(request: Request) {
@@ -114,8 +122,28 @@ export async function handleStrategySupervisor(request: Request, dependencies: S
 
   const history = await dependencies.listExecutions({ limit: 200 });
   const activeStates = new Set(["SUBMITTING", "PARTIALLY_FILLED", "HEDGING", "RECOVERING"]);
+  const crossQuoteReviews: Array<Record<string, unknown>> = [];
+  if (dependencies.acquireRecordLock && dependencies.releaseRecordLock && dependencies.emergencyStop) {
+    for (const record of history.records.filter(item => item.strategy === "crossQuote" && activeStates.has(item.state)).slice(0, 10)) {
+      const acquired = await dependencies.acquireRecordLock({
+        executionId: record.id,
+        owner: `cross-quote:restart-audit:${record.id}`,
+        ttlMs: 60_000
+      });
+      if (!acquired.acquired) {
+        crossQuoteReviews.push({ executionId: record.id, status: "owned-by-live-worker" });
+        continue;
+      }
+      try {
+        await dependencies.emergencyStop(`cross-quote-restart-review-required:${record.id}`);
+        crossQuoteReviews.push({ executionId: record.id, status: "manual-review", emergencyStop: true });
+      } finally {
+        await dependencies.releaseRecordLock(acquired.lock).catch(() => undefined);
+      }
+    }
+  }
   const activeSpot = history.records
-    .filter(record => (record.strategy === "stablecoin" || record.strategy === "imbalance")
+    .filter(record => (record.strategy === "stablecoin" || record.strategy === "gapTrading" || record.strategy === "imbalance")
       && Boolean(record.signalId)
       && activeStates.has(record.state))
     .sort((a, b) => a.updatedAt - b.updatedAt);
@@ -123,13 +151,17 @@ export async function handleStrategySupervisor(request: Request, dependencies: S
   // the authoritative fence: a healthy worker returns POSITION_ALREADY_OWNED,
   // while a restarted process can safely take over its dead generation.
   if (!activeSpot.length) {
-    return NextResponse.json({ status: "checked", pairs, spotRecoveries: [], activeSpotCount: 0 });
+    return NextResponse.json({ status: "checked", pairs, crossQuoteReviews, spotRecoveries: [], activeSpotCount: 0 });
   }
 
   const spotRecoveries: Array<Record<string, unknown>> = [];
   for (const record of activeSpot.slice(0, 10)) {
     if (!record.signalId) continue;
-    const kind: SpotPositionRouteKind = record.strategy === "stablecoin" ? "stablecoin" : "orderbook-imbalance";
+    const kind: SpotPositionRouteKind = record.strategy === "stablecoin"
+      ? "stablecoin"
+      : record.strategy === "gapTrading"
+        ? "orderbook-gap"
+        : "orderbook-imbalance";
     const response = await dependencies.recoverSpot(delegated({ signalId: record.signalId }), kind);
     spotRecoveries.push({ executionId: record.id, kind, ...await responsePayload(response) });
   }
@@ -138,6 +170,7 @@ export async function handleStrategySupervisor(request: Request, dependencies: S
   return NextResponse.json({
     status: recovered ? "recovery-checked" : "recovery-deferred",
     pairs,
+    crossQuoteReviews,
     spotRecoveries,
     activeSpotCount: activeSpot.length
   }, { status: failed ? 502 : 200 });

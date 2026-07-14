@@ -31,12 +31,10 @@ const IMPLEMENTED_READINESS: Record<RiskStrategy, Pick<StrategyReadiness,
   "positionStateReady" | "recoveryReady" | "executionAdapterReady"
 >> = {
   triangle: { positionStateReady: true, recoveryReady: true, executionAdapterReady: true },
-  crossQuote: { positionStateReady: false, recoveryReady: false, executionAdapterReady: true },
+  crossQuote: { positionStateReady: true, recoveryReady: true, executionAdapterReady: true },
   pairs: { positionStateReady: true, recoveryReady: true, executionAdapterReady: true },
   stablecoin: { positionStateReady: true, recoveryReady: true, executionAdapterReady: true },
-  // Orderbook Gap is intentionally shadow-only until a sequence-correct,
-  // event-level L2 + trade-flow feed and venue-specific calibration exist.
-  gapTrading: { positionStateReady: false, recoveryReady: false, executionAdapterReady: false },
+  gapTrading: { positionStateReady: true, recoveryReady: true, executionAdapterReady: true },
   imbalance: { positionStateReady: true, recoveryReady: true, executionAdapterReady: true }
 };
 

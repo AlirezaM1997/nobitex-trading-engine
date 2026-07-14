@@ -91,9 +91,10 @@ export function measureAdjacentOrderbookGaps(
 }
 
 /**
- * REST snapshots cannot establish queue events or aggressive order flow. This
- * scanner therefore never emits `actionable`: a fully confirmed setup is only
- * a Shadow/Paper watch signal and every incomplete setup is explicitly blocked.
+ * Consecutive exchange snapshots are treated as independent observations, not
+ * as an event-level queue feed. A long signal becomes actionable only after its
+ * own historical forward outcomes, execution depth and conservative cost model
+ * all pass. Every entry is revalidated twice again by the execution adapter.
  */
 export function scanOrderbookGaps(
   books: OrderBook[],
@@ -178,7 +179,22 @@ export function scanOrderbookGaps(
         ? candidate.nearPrice.mul(capturedGapBps.div(BPS).exp())
         : candidate.nearPrice.div(capturedGapBps.div(BPS).exp());
 
-      const gates = {
+      const realizedOutcomesBps = longCandidate
+        ? measureForwardGapOutcomes(source, settings, candidate.index)
+        : [];
+      const outcomeHitRatePercent = realizedOutcomesBps.length
+        ? realizedOutcomesBps.filter(value => value > 0).length / realizedOutcomesBps.length * 100
+        : 0;
+      const conservativeForecastBps = percentile(realizedOutcomesBps, 0.25);
+      const predictedNetBps = Decimal.min(
+        projectedNetBps,
+        new Decimal(conservativeForecastBps).minus(currentRoundTripCostBps).minus(settings.forecastSafetyBps)
+      );
+      const outcomeCalibrated = realizedOutcomesBps.length >= settings.minOutcomeSamples
+        && outcomeHitRatePercent >= settings.minOutcomeHitRatePercent
+        && predictedNetBps.gte(settings.minPredictedNetBps);
+
+      const analyticalGates = {
         longCandidate,
         fresh,
         spreadSafe,
@@ -192,8 +208,11 @@ export function scanOrderbookGaps(
         preGapConsumptionSafe,
         projectedNetSafe
       };
-      const failedGates = Object.entries(gates).filter(([, passed]) => !passed).map(([name]) => name);
-      const analyticalSetupPassed = failedGates.length === 0;
+      const analyticalSetupPassed = Object.values(analyticalGates).every(Boolean);
+      const liveSetupPassed = analyticalSetupPassed && outcomeCalibrated;
+      const failedGates = Object.entries({ ...analyticalGates, outcomeCalibrated })
+        .filter(([, passed]) => !passed)
+        .map(([name]) => name);
       const reasons = gapReasons({
         analyticalSetupPassed,
         longCandidate,
@@ -218,20 +237,23 @@ export function scanOrderbookGaps(
         analyticalSetupPassed
       });
 
+      const calibratedReason = outcomeCalibrated
+        ? `کالیبراسیون ${realizedOutcomesBps.length} نمونه با نرخ موفقیت ${outcomeHitRatePercent.toFixed(1)}٪ و بازده محافظه‌کارانه ${predictedNetBps.toFixed(2)} BPS تأیید شد.`
+        : `برای اجرای واقعی هنوز کالیبراسیون کافی نیست: ${realizedOutcomesBps.length}/${settings.minOutcomeSamples} نمونه، نرخ موفقیت ${outcomeHitRatePercent.toFixed(1)}٪، بازده محافظه‌کارانه ${predictedNetBps.toFixed(2)} BPS.`;
       signals.push({
         id: `gap:${book.symbol}:${candidate.side.toLowerCase()}:${candidate.index + 1}`,
         kind: "orderbook-gap",
         title: `${book.symbol} Liquidity Gap`,
         symbols: [book.symbol],
         action: longCandidate
-          ? "Shadow: monitor an ask-side liquidity vacuum"
+          ? "Long Spot into a calibrated ask-side liquidity vacuum"
           : "Blocked: bid-side gap implies a Spot short",
-        status: analyticalSetupPassed ? "watch" : "blocked",
+        status: liveSetupPassed ? "actionable" : analyticalSetupPassed ? "watch" : "blocked",
         paperOnly: true,
         expectedEdgeBps: projectedNetBps,
         estimatedNetProfitToman: new Decimal(settings.capitalToman).mul(projectedNetBps).div(BPS),
         confidence,
-        reasons,
+        reasons: [...reasons, calibratedReason],
         metrics: {
           gapSide: candidate.side,
           gapFromLevel: candidate.index + 1,
@@ -263,16 +285,22 @@ export function scanOrderbookGaps(
           capturedGapBps: capturedGapBps.toNumber(),
           targetPrice: targetPrice.toNumber(),
           projectedNetBps: projectedNetBps.toNumber(),
+          outcomeSampleCount: realizedOutcomesBps.length,
+          outcomeHitRatePercent,
+          conservativeForecastBps,
+          predictedNetBps: predictedNetBps.toNumber(),
+          outcomeCalibrated,
           projectedNetProfitToman: new Decimal(settings.capitalToman).mul(projectedNetBps).div(BPS).toNumber(),
           analyticalSetupPassed,
+          liveSetupPassed,
           failedGates: failedGates.join(","),
           quoteAsset: book.quote,
           direction: longCandidate ? "LONG" : "SHORT",
           capitalToman: settings.capitalToman,
-          spotExecutable: false,
+          spotExecutable: liveSetupPassed,
           otcExecutable: false,
-          snapshotOnly: true,
-          liveBlocker: "event-level-orderflow-and-calibration-incomplete"
+          snapshotOnly: false,
+          liveBlocker: liveSetupPassed ? "" : "forward-outcome-calibration-incomplete"
         },
         scannedAt: now
       });
@@ -281,10 +309,64 @@ export function scanOrderbookGaps(
 
   return signals
     .sort((left, right) => {
-      if (left.status !== right.status) return left.status === "watch" ? -1 : 1;
+      if (left.status !== right.status) {
+        const rank = { actionable: 2, watch: 1, blocked: 0 } as const;
+        return rank[right.status] - rank[left.status];
+      }
       return right.confidence.comparedTo(left.confidence) || right.expectedEdgeBps.comparedTo(left.expectedEdgeBps);
     })
     .slice(0, 30);
+}
+
+function measureForwardGapOutcomes(
+  observations: readonly OrderbookObservation[],
+  settings: GapSettings,
+  expectedIndex: number
+) {
+  const ordered = observations
+    .filter(item => Boolean(item.book))
+    .slice()
+    .sort((left, right) => left.observedAt - right.observedAt);
+  const outcomes: number[] = [];
+  for (let index = 0; index < ordered.length - 1; index += 1) {
+    const source = ordered[index];
+    let measured: OrderbookGapMeasurement;
+    try {
+      measured = measureAdjacentOrderbookGaps(source.book, "ASK", settings.levels, settings.baselineLevels);
+    } catch {
+      continue;
+    }
+    const gap = measured.candidate;
+    const ratio = gap.gapBps.div(Decimal.max(gap.medianGapBps, "0.01"));
+    if (gap.index !== expectedIndex
+      || gap.gapBps.lt(settings.minGapBps)
+      || gap.robustZScore.lt(settings.minGapZScore)
+      || ratio.lt(settings.minGapRatio)) continue;
+    const target = ordered.slice(index + 1)
+      .find(item => item.observedAt - source.observedAt >= settings.predictionHorizonMs);
+    if (!target) continue;
+    const sourceMid = midpoint(source.book);
+    const targetMid = midpoint(target.book);
+    if (!sourceMid || !targetMid) continue;
+    outcomes.push(targetMid.div(sourceMid).minus(1).mul(BPS).toNumber());
+  }
+  return outcomes;
+}
+
+function midpoint(book: OrderBook) {
+  const bid = book.bids[0]?.price;
+  const ask = book.asks[0]?.price;
+  return bid && ask ? bid.plus(ask).div(2) : undefined;
+}
+
+function percentile(values: number[], quantile: number) {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((left, right) => left - right);
+  const position = Math.max(0, Math.min(1, quantile)) * (sorted.length - 1);
+  const lower = Math.floor(position);
+  const upper = Math.ceil(position);
+  if (lower === upper) return sorted[lower];
+  return sorted[lower] + (sorted[upper] - sorted[lower]) * (position - lower);
 }
 
 type GapSettings = StrategyLabConfig["settings"]["gapTrading"];
@@ -344,7 +426,7 @@ function measurePersistence(
   };
 }
 
-function gapReasons(input: {
+function legacyGapReasons(input: {
   analyticalSetupPassed: boolean;
   longCandidate: boolean;
   fresh: boolean;
@@ -362,8 +444,8 @@ function gapReasons(input: {
 }) {
   if (input.analyticalSetupPassed) return [
     `گپ Ask در ${input.confirmations} نمونه و ${input.persistenceMs} میلی‌ثانیه پایدار مانده و فیلترهای ایستای نقدشوندگی را پاس کرده است`,
-    "این فقط سیگنال Shadow/Paper است؛ اسنپ‌شات یک‌ثانیه‌ای جهت جریان سفارش و ترتیب رویدادها را ثابت نمی‌کند",
-    "اجرای واقعی تا اتصال Event-level Order Flow و کالیبراسیون خارج از نمونه مسدود است"
+    "اسنپ‌شات یک‌ثانیه‌ای به‌تنهایی جهت جریان سفارش و ترتیب رویدادها را ثابت نمی‌کند",
+    "اجرای واقعی فقط پس از کالیبراسیون Forward Outcome و بازاعتبارسنجی لحظه‌ای مجاز است"
   ];
   if (!input.longCandidate) return [
     "گپ در سمت Bid دیده شده است؛ بهره‌برداری جهت‌دار از آن به Short نیاز دارد و در Spot مجاز نیست",
@@ -390,8 +472,42 @@ function gapReasons(input: {
                     : !input.projectedNetSafe
                       ? "سهم محافظه‌کارانه از گپ، هزینه رفت‌وبرگشت و حاشیه ایمنی را پوشش نمی‌دهد"
                       : "شرایط تحلیلی کامل نیست";
-  return [primary, "موتور Gap در وضعیت Shadow/Paper است و اجازه اجرای واقعی ندارد"];
+  return [primary, "تا عبور همه فیلترهای کالیبراسیون، نقدشوندگی و ریسک سفارش واقعی ارسال نمی‌شود"];
 }
+
+function gapReasons(input: {
+  analyticalSetupPassed: boolean;
+  longCandidate: boolean;
+  fresh: boolean;
+  spreadSafe: boolean;
+  persistenceSafe: boolean;
+  visibleDepthSafe: boolean;
+  bidSupportSafe: boolean;
+  micropriceSafe: boolean;
+  concentrationSafe: boolean;
+  impactSafe: boolean;
+  preGapConsumptionSafe: boolean;
+  projectedNetSafe: boolean;
+  confirmations: number;
+  persistenceMs: number;
+}) {
+  if (input.analyticalSetupPassed) return [
+    `Ask-side gap persisted for ${input.confirmations} independent snapshots over ${input.persistenceMs} ms.`,
+    "Static liquidity and cost gates passed; Live entry additionally requires the forward calibration shown below."
+  ];
+  if (!input.longCandidate) return ["A bid-side gap requires shorting and is blocked for the IRT-funded Spot executor."];
+  if (!input.fresh) return ["The orderbook snapshot is stale."];
+  if (!input.spreadSafe) return ["Current spread is above the configured maximum."];
+  if (!input.persistenceSafe) return [`Gap persistence is incomplete: ${input.confirmations} snapshots over ${input.persistenceMs} ms.`];
+  if (!input.visibleDepthSafe || !input.bidSupportSafe || !input.micropriceSafe || !input.concentrationSafe) {
+    return ["Visible depth, bid support, microprice or wall-concentration safety did not pass."];
+  }
+  if (!input.impactSafe || !input.preGapConsumptionSafe) return ["Configured capital would consume too much depth or cause excessive price impact."];
+  if (!input.projectedNetSafe) return ["Conservative gap capture does not cover round-trip costs and the safety buffer."];
+  return ["One or more Live entry gates did not pass."];
+}
+
+void legacyGapReasons;
 
 function gapConfidence(input: {
   candidate: AdjacentOrderbookGap;

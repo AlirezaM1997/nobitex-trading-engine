@@ -1,6 +1,14 @@
 import Decimal from "decimal.js";
 import { config as appConfig } from "@/lib/config";
-import { quoteEdge } from "@/lib/bot/engine";
+import { findTriangularOpportunities, quoteEdge } from "@/lib/bot/engine";
+import {
+  executeLive,
+  LiveExecutionRecoveredError,
+  LiveManualInterventionError,
+  type ExecutionLeg,
+  type LiveExecutionHooks
+} from "@/lib/bot/executor";
+import { defaultBotSettings, type BotSettings } from "@/lib/bot-settings";
 import type { LegQuote } from "@/lib/bot/types";
 import type { MarketOptions, NobitexOrder, OrderBook, Side } from "@/lib/exchanges/types";
 import type { StrategySignal } from "./types";
@@ -8,7 +16,7 @@ import type { StrategySignal } from "./types";
 const BPS = new Decimal(10_000);
 
 export type CrossQuoteDirection = "IRT_TO_USDT" | "USDT_TO_IRT";
-export type CrossQuoteOrderStage = "leg1" | "leg2" | "recovery";
+export type CrossQuoteOrderStage = "leg1" | "leg2" | "leg3" | "recovery";
 
 export type CrossQuoteOrderRequest = {
   side: Side;
@@ -26,6 +34,7 @@ export type CrossQuoteExecutionClient = {
   getMarketOptions(): Promise<MarketOptions>;
   placeMarketOrder(input: CrossQuoteOrderRequest): Promise<NobitexOrder>;
   getOrderStatus(id: string): Promise<NobitexOrder>;
+  getOrderStatusByClientOrderId?(clientOrderId: string): Promise<NobitexOrder>;
   cancelOrder(id: string): Promise<void>;
 };
 
@@ -82,7 +91,7 @@ export type CrossQuoteRevalidation = {
   requiredEdgeBps: Decimal;
   referenceOutput: Decimal;
   referenceAsset: "IRT" | "USDT";
-  legs: readonly [LegQuote, LegQuote];
+  legs: readonly LegQuote[];
 };
 
 export type CrossQuoteExecutionLeg = {
@@ -131,8 +140,12 @@ export type CrossQuoteExecutionResult = {
   legs: CrossQuoteExecutionLeg[];
   finalAsset: "IRT" | "USDT";
   finalOutput: Decimal;
+  /** Confirmed IRT actually consumed by the first order. */
+  actualInputToman?: Decimal;
   /** Sub-step dust left after flooring a SELL to the exchange amount precision. */
   residualAssetAmount: Decimal;
+  /** True only when the executor has proved there is no non-IRT inventory left. */
+  fullySettled?: boolean;
   actualEdgeBps?: Decimal;
   recoveryReason?: string;
 };
@@ -355,8 +368,155 @@ export async function executeCrossQuote(
     finalAsset: plan.direction === "IRT_TO_USDT" ? "USDT" : "IRT",
     finalOutput: second.actualOutput,
     residualAssetAmount,
+    fullySettled: residualAssetAmount.eq(0) && plan.direction === "USDT_TO_IRT",
     actualEdgeBps
   };
+}
+
+/**
+ * Production Cross-Quote execution is a closed IRT cycle. The analytical
+ * two-quote comparison nominates a direction, while the battle-tested Triangle
+ * inventory ledger adds the USDT/IRT settlement leg, protected revalidation,
+ * clientOrderId reconciliation and multi-asset recovery.
+ */
+export async function executeClosedCrossQuote(
+  plan: CrossQuoteExecutionPlan,
+  client: CrossQuoteExecutionClient,
+  hooks: CrossQuoteExecutionHooks = {},
+  options: CrossQuoteExecutionOptions = {}
+): Promise<CrossQuoteExecutionResult> {
+  assertMainnet(client, options);
+  const [books, marketOptions] = await Promise.all([client.getAllOrderBooks(), client.getMarketOptions()]);
+  const desiredRoute = plan.direction === "IRT_TO_USDT"
+    ? ["IRT", plan.asset, "USDT", "IRT"]
+    : ["IRT", "USDT", plan.asset, "IRT"];
+  const settings = closedCycleSettings(plan);
+  const opportunity = findTriangularOpportunities({
+    books,
+    options: marketOptions,
+    capitalToman: plan.capitalToman,
+    tomanFeeBps: plan.config.tomanTakerFeeBps,
+    usdtFeeBps: plan.config.usdtTakerFeeBps,
+    slippageBps: plan.config.slippageBps,
+    maxPriceImpactBps: plan.config.maxPriceImpactBps,
+    maxSpreadBps: plan.config.maxSpreadBps,
+    depthUsagePercent: plan.config.depthUsagePercent,
+    minProfitBps: plan.config.minEdgeBps,
+    minNetProfitToman: 0,
+    liveSafetyBufferBps: plan.config.liveSafetyBufferBps,
+    maxAgeMs: plan.config.maxAgeMs
+  })
+    .filter(candidate => candidate.executable && sameRoute(candidate.route, desiredRoute))
+    .sort((left, right) => right.netProfitToman.comparedTo(left.netProfitToman))[0];
+  if (!opportunity) throw revalidationError("The closed IRT Cross-Quote cycle is no longer executable");
+
+  const entry: CrossQuoteRevalidation = {
+    checkedAt: Date.now(),
+    edgeBps: opportunity.profitBps,
+    requiredEdgeBps: plan.config.minEdgeBps.plus(plan.config.liveSafetyBufferBps),
+    referenceOutput: opportunity.inputToman,
+    referenceAsset: "IRT",
+    legs: opportunity.legs
+  };
+  const persisted = new Map<string, CrossQuoteExecutionLeg>();
+  let prepared = opportunity;
+  const liveHooks: LiveExecutionHooks = {
+    onPrepared: async fresh => {
+      prepared = fresh;
+      await hooks.onRevalidated?.({ phase: "entry-2", plan, edgeBps: fresh.profitBps });
+    },
+    onBeforeOrder: async (index, context) => {
+      const quote = prepared.legs[index];
+      if (!quote) throw new Error(`Missing prepared Cross-Quote leg ${index + 1}`);
+      await hooks.onBeforeOrder?.({
+        stage: cycleStage(index),
+        plan,
+        quote,
+        request: {
+          side: context.side,
+          base: quote.edge.book.base,
+          quote: quote.edge.book.quote,
+          amountBase: context.amountBase,
+          expectedPrice: context.protectedPrice,
+          clientOrderId: context.clientOrderId
+        }
+      });
+    },
+    onBeforeRecoveryOrder: async event => {
+      const freshBooks = await client.getAllOrderBooks();
+      const book = freshBooks.find(item => item.symbol.toUpperCase() === event.symbol.toUpperCase());
+      if (!book) throw new Error(`Recovery market ${event.symbol} disappeared`);
+      const recoveryQuote = quoteEdge(edge("SELL", book), event.requestedInput, plan.config.tomanTakerFeeBps, plan.config.recoverySlippageBps, 100);
+      if (!recoveryQuote) throw new Error(`Recovery market ${event.symbol} has insufficient depth`);
+      await hooks.onBeforeOrder?.({
+        stage: "recovery",
+        plan,
+        quote: recoveryQuote,
+        request: {
+          side: "SELL",
+          base: book.base,
+          quote: book.quote,
+          amountBase: event.amountBase,
+          expectedPrice: event.protectedPrice,
+          clientOrderId: event.clientOrderId
+        }
+      });
+    },
+    onLeg: async leg => {
+      if (!leg.matchedAmount || !leg.unmatchedAmount) return;
+      if (!isTerminal(leg.status)) return;
+      const index = leg.stage === "recovery"
+        ? -1
+        : prepared.legs.findIndex(item => item.edge.book.symbol === leg.symbol);
+      const mapped = mapLiveLeg(leg, index >= 0 ? cycleStage(index) : "recovery");
+      persisted.set(mapped.clientOrderId || mapped.orderId, mapped);
+      await hooks.onOrderFinalized?.({ stage: mapped.stage, plan, leg: mapped });
+    },
+    onRecoveryStarted: async event => {
+      for (const position of event.inventory) {
+        await hooks.onRecoveryStarted?.({ plan, assetAmount: position.amount, reason: event.reason });
+      }
+    }
+  };
+
+  try {
+    const result = await executeLive(opportunity, settings, client, liveHooks, { books, options: marketOptions });
+    return {
+      status: "completed",
+      plan,
+      entry,
+      legs: [...persisted.values()],
+      finalAsset: "IRT",
+      finalOutput: result.outputToman,
+      actualInputToman: result.inputToman,
+      residualAssetAmount: result.residualInventory[0]?.amount ?? new Decimal(0),
+      fullySettled: result.fullySettled,
+      actualEdgeBps: result.inputToman.gt(0) ? result.profitToman.div(result.inputToman).mul(BPS) : new Decimal(0)
+    };
+  } catch (error) {
+    if (error instanceof LiveExecutionRecoveredError) {
+      const input = error.recovery.actualInputToman;
+      return {
+        status: "recovered",
+        plan,
+        entry,
+        legs: [...persisted.values()],
+        finalAsset: "IRT",
+        finalOutput: error.recovery.economicRecoveredToman,
+        actualInputToman: input,
+        residualAssetAmount: error.recovery.residualInventory[0]?.amount ?? new Decimal(0),
+        fullySettled: error.recovery.residualInventory.length === 0,
+        actualEdgeBps: input.gt(0)
+          ? error.recovery.economicRecoveredToman.minus(input).div(input).mul(BPS)
+          : new Decimal(0),
+        recoveryReason: error.message
+      };
+    }
+    if (error instanceof LiveManualInterventionError) {
+      throw new CrossQuoteExecutionError(error.message, "ORDER_STATE_UNKNOWN", true, { cause: error });
+    }
+    throw error;
+  }
 }
 
 function revalidateSecondLeg(
@@ -412,6 +572,7 @@ async function recoverExposure(
       finalAsset: "IRT",
       finalOutput: recovery.actualOutput,
       residualAssetAmount: Decimal.max(assetAmount.minus(recovery.matchedAmountBase), 0),
+      fullySettled: Decimal.max(assetAmount.minus(recovery.matchedAmountBase), 0).eq(0),
       recoveryReason: reason
     };
   } catch (error) {
@@ -594,6 +755,58 @@ function floorStep(value: Decimal, step: Decimal) { return value.div(step).floor
 function priceToStep(side: Side, value: Decimal, step: Decimal) {
   const units = value.div(step);
   return (side === "BUY" ? units.floor() : units.ceil()).mul(step);
+}
+function closedCycleSettings(plan: CrossQuoteExecutionPlan): BotSettings {
+  return {
+    ...defaultBotSettings,
+    paperCapitalToman: plan.capitalToman.toNumber(),
+    maxTradeToman: plan.capitalToman.toNumber(),
+    balanceUsagePercent: 100,
+    tomanTakerFeeBps: plan.config.tomanTakerFeeBps.toNumber(),
+    usdtTakerFeeBps: plan.config.usdtTakerFeeBps.toNumber(),
+    slippageBufferBps: plan.config.slippageBps.toNumber(),
+    liveSafetyBufferBps: plan.config.liveSafetyBufferBps.toNumber(),
+    maxPriceImpactBps: plan.config.maxPriceImpactBps.toNumber(),
+    maxSpreadBps: plan.config.maxSpreadBps.toNumber(),
+    orderbookDepthUsagePercent: plan.config.depthUsagePercent.toNumber(),
+    minProfitBps: plan.config.minEdgeBps.toNumber(),
+    minNetProfitToman: 0,
+    orderbookMaxAgeMs: plan.config.maxAgeMs,
+    orderTimeoutMs: plan.config.orderTimeoutMs
+  };
+}
+function sameRoute(left: readonly string[], right: readonly string[]) {
+  return left.length === right.length && left.every((asset, index) => asset === right[index]);
+}
+function cycleStage(index: number): Exclude<CrossQuoteOrderStage, "recovery"> {
+  if (index === 0) return "leg1";
+  if (index === 1) return "leg2";
+  return "leg3";
+}
+function mapLiveLeg(leg: ExecutionLeg, stage: CrossQuoteOrderStage): CrossQuoteExecutionLeg {
+  const inputAsset = leg.inputAsset ?? "";
+  const outputAsset = leg.outputAsset ?? "";
+  const matched = new Decimal(leg.matchedAmount ?? 0);
+  const unmatched = new Decimal(leg.unmatchedAmount ?? 0);
+  return {
+    stage,
+    symbol: leg.symbol,
+    side: leg.side as Side,
+    orderId: leg.orderId,
+    clientOrderId: leg.clientOrderId ?? leg.orderId,
+    status: leg.status,
+    submittedAmountBase: matched.plus(unmatched),
+    matchedAmountBase: matched,
+    unmatchedAmountBase: unmatched,
+    actualInput: new Decimal(leg.input || 0),
+    inputAsset,
+    actualOutput: new Decimal(leg.output || 0),
+    outputAsset,
+    fee: new Decimal(leg.fee || 0),
+    feeAsset: outputAsset,
+    averagePrice: new Decimal(leg.averagePrice || 0),
+    fullFill: matched.gt(0) && unmatched.lte(0)
+  };
 }
 function isTerminal(status: string) { return ["done", "canceled", "cancelled", "rejected"].includes(status.toLowerCase()); }
 function makeClientOrderId(plan: CrossQuoteExecutionPlan, stage: CrossQuoteOrderStage) {

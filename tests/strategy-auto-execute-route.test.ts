@@ -31,9 +31,9 @@ describe("automatic strategy execution route", () => {
   test("rejects foreign origins and unknown engines", async () => {
     expect((await POST(dashboardRequest({ kind: "stablecoin", signalId: "stablecoin:USDC" }, "https://attacker.example"))).status).toBe(403);
     expect((await POST(dashboardRequest({ kind: "market-making", signalId: "maker:BTCIRT" }))).status).toBe(400);
-    // Gap analysis is deliberately Shadow-only and must not be accepted by the
-    // automatic execution front door even when the signal id is well-formed.
-    expect((await POST(dashboardRequest({ kind: "orderbook-gap", signalId: "gap:BTCIRT:ask:1" }))).status).toBe(400);
+    // Gap is a supported engine; without a current calibrated signal it is
+    // safely rejected by its fresh server-side scan before any order.
+    expect((await POST(dashboardRequest({ kind: "orderbook-gap", signalId: "gap:BTCIRT:ask:1" }))).status).toBe(409);
   });
 
   test("skips a recently completed stable signal before any exchange work", async () => {

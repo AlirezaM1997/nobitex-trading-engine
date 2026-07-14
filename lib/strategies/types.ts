@@ -17,6 +17,8 @@ export type StrategySignal = {
   estimatedNetProfitToman: Decimal;
   confidence: Decimal;
   reasons: string[];
+  /** Retained only while migrating old signal copy; dashboards must use `reasons`. */
+  legacyReasons?: string[];
   metrics: Record<string, string | number | boolean>;
   scannedAt: number;
 };

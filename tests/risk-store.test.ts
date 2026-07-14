@@ -99,22 +99,17 @@ describe("persistent risk control", () => {
       }
     });
     expect(state.strategies.crossQuote.readiness).toMatchObject({
-      positionStateReady: false,
-      recoveryReady: false,
+      positionStateReady: true,
+      recoveryReady: true,
       executionAdapterReady: true
     });
-    for (const strategy of ["pairs", "stablecoin", "imbalance"] as const) {
+    for (const strategy of ["pairs", "stablecoin", "gapTrading", "imbalance"] as const) {
       expect(state.strategies[strategy].readiness).toMatchObject({
         positionStateReady: true,
         recoveryReady: true,
         executionAdapterReady: true
       });
     }
-    expect(state.strategies.gapTrading.readiness).toMatchObject({
-      positionStateReady: false,
-      recoveryReady: false,
-      executionAdapterReady: false
-    });
     expect(Object.entries(state.strategies).filter(([name]) => name !== "triangle").every(([, strategy]) => !strategy.enabled)).toBe(true);
     expect((await getRiskControlSnapshot()).evaluation.canExecute).toBe(false);
   });
@@ -138,7 +133,7 @@ describe("persistent risk control", () => {
     expect("marketMaking" in state.strategies).toBe(false);
     expect(state.strategies.gapTrading).toMatchObject({
       enabled: false,
-      readiness: { positionStateReady: false, recoveryReady: false, executionAdapterReady: false }
+      readiness: { positionStateReady: true, recoveryReady: true, executionAdapterReady: true }
     });
   });
 
@@ -180,16 +175,13 @@ describe("persistent risk control", () => {
     expect(await releaseExecutionLease(recovery.lease)).toBe(true);
   });
 
-  test("blocks shadow-only entry adapters while keeping their recovery lane available", async () => {
+  test("allows an implemented Mainnet adapter while keeping its recovery lane available", async () => {
     const now = Date.parse("2026-07-12T12:00:00.000Z");
     await configureRiskState({ strategies: { pairs: { enabled: true } } }, now);
     await armRiskControl(now);
     const entry = await acquireExecutionLease({ strategy: "pairs", owner: "pairs-entry", ttlMs: 5_000, now });
-    expect(entry).toMatchObject({
-      acquired: false,
-      reason: "risk-blocked",
-      blockers: ["runtime-execution-unavailable"]
-    });
+    expect(entry.acquired).toBe(true);
+    if (entry.acquired) await releaseExecutionLease(entry.lease);
     const recovery = await acquireRecoveryLease({ strategy: "pairs", owner: "pairs-position:7", ttlMs: 5_000, now });
     expect(recovery.acquired).toBe(true);
     if (recovery.acquired) await releaseExecutionLease(recovery.lease);

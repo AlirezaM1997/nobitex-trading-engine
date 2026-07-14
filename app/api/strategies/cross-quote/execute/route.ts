@@ -11,14 +11,20 @@ import {
   emergencyStopRiskControl,
   evaluateRiskState,
   getRiskState,
+  recordRealizedPnl,
   renewExecutionLease,
   releaseExecutionLease
 } from "@/lib/risk/store";
 import type { ExecutionLease, RiskEvaluation, RiskState } from "@/lib/risk/types";
 import {
+  acquireStrategyExecutionRecordLock,
+  releaseStrategyExecutionRecordLock,
+  type StrategyExecutionRecordLock
+} from "@/lib/strategy-execution-lock";
+import {
   CrossQuoteExecutionError,
   createCrossQuoteExecutionPlan,
-  executeCrossQuote,
+  executeClosedCrossQuote,
   type CrossQuoteExecutionClient,
   type CrossQuoteExecutionHooks,
   type CrossQuoteExecutionPlan,
@@ -55,6 +61,9 @@ export type CrossQuoteRouteDependencies = {
   getRiskState: typeof getRiskState;
   evaluateRisk(state: RiskState): RiskEvaluation;
   emergencyStop: typeof emergencyStopRiskControl;
+  recordPnl?: typeof recordRealizedPnl;
+  acquireRecordLock?: typeof acquireStrategyExecutionRecordLock;
+  releaseRecordLock?: typeof releaseStrategyExecutionRecordLock;
   createExecution: typeof createStrategyExecution;
   transitionExecution: typeof transitionStrategyExecution;
   addOrder: typeof addStrategyExecutionOrder;
@@ -64,10 +73,7 @@ export type CrossQuoteRouteDependencies = {
 };
 
 const defaultDependencies: CrossQuoteRouteDependencies = {
-  // The engine remains fail-closed until durable restart recovery and closed
-  // Toman PnL accounting are implemented. This is a technical lock, not an
-  // environment or risk lock.
-  runtimeAvailable: () => false,
+  runtimeAvailable: () => true,
   getSettings: getBotSettings,
   createClient: () => new NobitexClient(),
   scanStrategies: (books, settings, client) => scanConfiguredStrategies(books, settings, client as NobitexClient),
@@ -91,12 +97,15 @@ const defaultDependencies: CrossQuoteRouteDependencies = {
   getRiskState,
   evaluateRisk: evaluateRiskState,
   emergencyStop: emergencyStopRiskControl,
+  recordPnl: recordRealizedPnl,
+  acquireRecordLock: acquireStrategyExecutionRecordLock,
+  releaseRecordLock: releaseStrategyExecutionRecordLock,
   createExecution: createStrategyExecution,
   transitionExecution: transitionStrategyExecution,
   addOrder: addStrategyExecutionOrder,
   completeExecution: completeStrategyExecution,
   failExecution: failStrategyExecution,
-  execute: (plan, client, hooks) => executeCrossQuote(plan, client, hooks, { baseUrl: config.NOBITEX_API_BASE })
+  execute: (plan, client, hooks) => executeClosedCrossQuote(plan, client, hooks, { baseUrl: config.NOBITEX_API_BASE })
 };
 
 export async function POST(request: Request) {
@@ -126,6 +135,7 @@ export async function handleCrossQuoteExecute(request: Request, dependencies: Cr
   }
 
   let lease: ExecutionLease | undefined;
+  let recordLock: StrategyExecutionRecordLock | undefined;
   let executionId: number | undefined;
   let executionState: StrategyExecutionState | undefined;
   try {
@@ -176,12 +186,24 @@ export async function handleCrossQuoteExecute(request: Request, dependencies: Cr
         signalScannedAt: signal.scannedAt,
         signalEdgeBps: signal.expectedEdgeBps.toString(),
         requiredEdgeBps: plan.config.minEdgeBps.plus(plan.config.liveSafetyBufferBps).toString(),
-        accounting: "inventory-rotation-not-closed-toman-pnl",
+        accounting: "closed-irt-cycle",
         environment: "mainnet"
       }
     });
     executionId = record.id;
     executionState = "DETECTED";
+    if (dependencies.acquireRecordLock) {
+      const recordLockResult = await dependencies.acquireRecordLock({
+        executionId,
+        owner: `cross-quote:execution:${executionId}`,
+        ttlMs: 600_000
+      });
+      if (!recordLockResult.acquired) {
+        await dependencies.failExecution(executionId, "Cross-Quote execution record is already owned").catch(() => undefined);
+        return NextResponse.json({ status: "busy", code: "POSITION_ALREADY_OWNED" }, { status: 409 });
+      }
+      recordLock = recordLockResult.lock;
+    }
 
     const transition = async (to: StrategyExecutionState, note: string, metadata?: Record<string, unknown>) => {
       if (executionId === undefined || executionState === to) return;
@@ -190,7 +212,7 @@ export async function handleCrossQuoteExecute(request: Request, dependencies: Cr
     };
     await transition("REVALIDATING", "Fresh server-side Cross-Quote revalidation started");
 
-    const legIndex = { leg1: 0, leg2: 1, recovery: 2 } as const;
+    const legIndex = { leg1: 0, leg2: 1, leg3: 2, recovery: 3 } as const;
     const hooks: CrossQuoteExecutionHooks = {
       onRevalidated: async event => {
         // This is intentionally an order-free audit event. The immutable plan and final fills are persisted separately.
@@ -285,24 +307,53 @@ export async function handleCrossQuoteExecute(request: Request, dependencies: Cr
     };
 
     const result = await dependencies.execute(plan, client, hooks);
+    const normalLegCount = result.legs.filter(leg => leg.stage !== "recovery").length;
+    if (result.finalAsset !== "IRT"
+      || !result.actualInputToman
+      || result.actualInputToman.lte(0)
+      || result.fullySettled !== true
+      || (result.status === "completed" && normalLegCount < 3)) {
+      throw new CrossQuoteExecutionError(
+        "Cross-Quote did not prove a complete IRT-funded, IRT-settled three-leg cycle",
+        "RECOVERY_FAILED",
+        true
+      );
+    }
     if (result.status === "recovered" && (executionState as StrategyExecutionState) !== "RECOVERING") {
       await transition("RECOVERING", "Automatic recovery completed", { reason: result.recoveryReason });
     }
+    const actualInputToman = result.actualInputToman;
+    const actualProfitToman = result.finalOutput.minus(actualInputToman);
     await dependencies.completeExecution(executionId, {
-      note: result.status === "recovered" ? "Cross-Quote exposure recovered to IRT" : "Cross-Quote inventory rotation completed",
-      actualOutputToman: result.finalAsset === "IRT" ? result.finalOutput.toNumber() : null,
-      actualProfitToman: null,
+      note: result.status === "recovered" ? "Cross-Quote exposure recovered to IRT" : "Cross-Quote closed IRT cycle completed",
+      actualOutputToman: result.finalOutput.toNumber(),
+      actualProfitToman: actualProfitToman.toNumber(),
       metadata: {
         resultStatus: result.status,
         finalAsset: result.finalAsset,
         finalOutput: result.finalOutput.toString(),
         residualAssetAmount: result.residualAssetAmount.toString(),
+        fullySettled: result.fullySettled,
         actualEdgeBps: result.actualEdgeBps?.toString() ?? null,
         recoveryReason: result.recoveryReason ?? null,
-        pnlRecorded: false
+        actualInputToman: actualInputToman.toString(),
+        pnlRecorded: Boolean(dependencies.recordPnl)
       }
     });
     executionState = "CLOSED";
+    if (dependencies.recordPnl) {
+      try {
+        await dependencies.recordPnl(actualProfitToman.toNumber(), new Date(), {
+          idempotencyKey: `crossQuote:${executionId}:pnl`
+        });
+      } catch (error) {
+        await dependencies.emergencyStop(`cross-quote-risk-accounting-failed:${error instanceof Error ? error.message : "unknown"}`).catch(() => undefined);
+        throw error;
+      }
+    }
+    if (actualProfitToman.lt(0)) {
+      await dependencies.emergencyStop("cross-quote-realized-loss-circuit-breaker").catch(() => undefined);
+    }
 
     return NextResponse.json({
       status: result.status,
@@ -312,10 +363,13 @@ export async function handleCrossQuoteExecute(request: Request, dependencies: Cr
       finalAsset: result.finalAsset,
       finalOutput: result.finalOutput.toString(),
       residualAssetAmount: result.residualAssetAmount.toString(),
+      fullySettled: result.fullySettled,
       actualEdgeBps: result.actualEdgeBps?.toString(),
       recoveryReason: result.recoveryReason,
       legs: result.legs.map(serializeLeg),
-      pnlRecorded: false
+      actualInputToman: actualInputToman.toString(),
+      profitToman: actualProfitToman.toString(),
+      pnlRecorded: Boolean(dependencies.recordPnl)
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Cross-Quote execution failed";
@@ -360,6 +414,7 @@ export async function handleCrossQuoteExecute(request: Request, dependencies: Cr
     }, { status });
   } finally {
     if (lease) await dependencies.releaseLease(lease).catch(() => undefined);
+    if (recordLock && dependencies.releaseRecordLock) await dependencies.releaseRecordLock(recordLock).catch(() => undefined);
   }
 }
 

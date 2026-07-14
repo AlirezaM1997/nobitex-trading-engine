@@ -72,11 +72,11 @@ const strategyMeta: Record<RiskStrategy, StrategyMeta> = {
   crossQuote: {
     title: "آربیتراژ دو بازار",
     english: "Cross-Quote Inventory",
-    mechanism: "قیمت همان دارایی در بازار IRT و USDT مقایسه و یک چرخش دوضلع اجرا می‌شود؛ این نسخه یک چرخه تومانی بسته و سه‌ضلع نیست.",
-    assets: "بسته به جهت سیگنال، مبدأ IRT یا USDT و مقصد می‌تواند USDT یا IRT باشد؛ برای تکرار عملیات باید موجودی هر دو سمت جداگانه مدیریت و متعادل شود.",
-    entryExit: "ورود پس از عبور Net Edge و کنترل اسپرد و عمق است؛ خروج ضلع دوم ممکن است با USDT تمام شود و در نسخه فعلی PnL بسته تومانی محسوب نمی‌شود.",
-    recovery: "Recovery داخل همان درخواست می‌تواند Fill شناخته‌شده را برگرداند، اما برنامه بازیابی پایدار پس از Restart و Supervisor مستقل این موتور هنوز کامل نیست؛ به همین علت اجرای واقعی آن غیرفعال است.",
-    risks: "ریسک نرخ USDT/IRT، عدم‌تعادل Inventory، لغزش دو بازار و سفارش ناقص. تا تکمیل Position State، Recovery پایدار و حسابداری PnL بسته، این موتور مجوز شروع سفارش ندارد.",
+    mechanism: "قیمت همان دارایی در بازار IRT و USDT مقایسه می‌شود؛ برای حذف ریسک موجودی، اجرای واقعی همیشه ضلع تسویه USDT/IRT را هم اضافه و چرخه را با تومان می‌بندد.",
+    assets: "مبدأ و مقصد IRT است و دارایی و USDT فقط موجودی میانی همان اجرای ثبت‌شده هستند.",
+    entryExit: "ورود پس از بازاعتبارسنجی سه بازار، عمق، اسپرد، اثر قیمت و حاشیه Live است؛ نتیجه فقط پس از بازگشت به IRT به‌عنوان PnL ثبت می‌شود.",
+    recovery: "Inventory هر Fill جداگانه ثبت می‌شود؛ خطای ضلع دوم یا سوم دارایی‌های میانی را از بازار مستقیم IRT بازیابی می‌کند و اجرای رهاشده پس از Restart توقف اضطراری ایجاد می‌کند.",
+    risks: "تغییر نرخ USDT/IRT، Partial Fill، افت عمق و تأخیر API؛ به همین دلیل چرخه دو بار پیش از سفارش و بعد از هر Fill دوباره قیمت‌گذاری می‌شود.",
     settingsHref: "#strategy-cross-quote",
     settingsLabel: "تنظیمات Cross-Quote"
   },
@@ -105,11 +105,11 @@ const strategyMeta: Record<RiskStrategy, StrategyMeta> = {
   gapTrading: {
     title: "شکاف نقدشوندگی اردربوک",
     english: "Orderbook Gap / Liquidity Vacuum",
-    mechanism: "فاصله بین Levelهای مجاور Ask با خط مبنای مقاوم همان اردربوک مقایسه می‌شود. فقط Gap غیرعادی و پایدار که با فشار Bid، Microprice و کاهش کنترل‌شده نقدینگی پیش از شکاف هم‌جهت باشد به‌عنوان سیگنال سایه ثبت می‌شود.",
+    mechanism: "فاصله بین Levelهای Ask با Median/MAD همان اردربوک مقایسه می‌شود. ورود فقط وقتی مجاز است که Gap پایدار، فشار Bid، Microprice، عمق و نتیجه‌های آینده مستقل هم‌زمان تأیید شوند.",
     assets: "تحلیل فعلی فقط اردربوک عمومی Spot را پوشش می‌دهد. OTC / خرید آسان اردربوک عمومی و API رسمی پشتیبانی‌شده برای Quote و Execution ندارد، پس Gap آن قابل اندازه‌گیری یا اجرای امن نیست.",
-    entryExit: "این نسخه Shadow/Paper است و سفارش ارسال نمی‌کند. بازده پیش‌بینی‌شده پس از Spread، کارمزد، اثر قیمت، سهم محافظه‌کارانه از Gap و عمق قابل استفاده محاسبه می‌شود.",
-    recovery: "چون پوزیشن واقعی باز نمی‌شود Recovery معاملاتی ندارد. Snapshot کهنه، ناپایداری Gap، تمرکز مشکوک سطح اول یا عبور هزینه اجرا از بازده مدل، سیگنال را فوراً رد می‌کند.",
-    risks: "Gap ایستا آربیتراژ قطعی نیست؛ ممکن است با یک سفارش لغوشده، Spoofing، Feed تأخیردار یا نبود تقاضای تهاجمی ناپدید شود. برای Live به فید event-level، کالیبراسیون Out-of-sample و کنترل خروج نیاز است.",
+    entryExit: "با IRT وارد Spot می‌شود؛ پایان Gap، Take Profit، Stop Loss، سقف زیان یا Time Stop خروج را فعال و دارایی را دوباره به IRT تبدیل می‌کند.",
+    recovery: "وضعیت سفارش و پوزیشن پایدار ثبت می‌شود؛ پس از خطا یا Restart فقط مقدار دارایی اثبات‌شده از Order IDها با Recovery Lease به IRT برمی‌گردد.",
+    risks: "Gap آربیتراژ قطعی نیست و ممکن است با لغو سفارش یا Spoofing ناپدید شود؛ کالیبراسیون Forward Outcome و خروج حفاظتی ریسک را کم می‌کنند اما سود را تضمین نمی‌کنند.",
     settingsHref: "#strategy-orderbook-gap",
     settingsLabel: "تنظیمات Orderbook Gap"
   },
@@ -343,7 +343,7 @@ export default function RiskCenter({ snapshot: controlledSnapshot, onSnapshot, s
           const environmentSupported = (!capability || (
             capability.scope === "mainnet-only" && environment?.kind === "mainnet"
           )) && !evaluation.blockers.includes("runtime-environment-not-supported");
-          const shadowOnly = strategy === "gapTrading";
+          const shadowOnly = false;
           const runtimeCanExecute = evaluation.canExecute && environmentSupported && !runtimeUnavailable;
           const unavailableReason = capability?.blocker === "event-level-orderflow-and-calibration-incomplete"
             ? "فید event-level، کالیبراسیون آماری و مدل خروج هنوز برای اجرای واقعی تأیید نشده‌اند؛ تحلیل سایه ادامه دارد."
@@ -392,6 +392,7 @@ function schedulerOutcomeLabel(outcome: LiveSchedulerStatus["lastOutcome"]) {
     "not-production": "محیط Production نیست",
     "master-disarmed": "اجرای کلی خاموش",
     "triangle-disabled": "Triangle خاموش",
+    "engines-disabled": "همه موتورهای اجرای واقعی خاموش‌اند",
     "risk-blocked": "متوقف توسط کنترل ریسک",
     "owner-not-held": "مالک Live در اختیار این سرور نیست",
     "in-flight": "اسکن قبلی در حال اجرا",

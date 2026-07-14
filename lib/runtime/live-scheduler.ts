@@ -2,6 +2,10 @@ import { randomUUID } from "node:crypto";
 import { getBotSettings } from "@/lib/bot-settings-store";
 import { getRiskControlSnapshot } from "@/lib/risk/store";
 import { STRATEGY_RUNTIME_CAPABILITIES } from "@/lib/strategy-runtime-capabilities";
+import { NobitexClient } from "@/lib/exchanges/nobitex";
+import { scanConfiguredStrategies } from "@/lib/strategies/service";
+import type { StrategyKind, StrategySignal } from "@/lib/strategies/types";
+import type { RiskStrategy } from "@/lib/risk/types";
 import {
   assertLiveOwnerForOrder,
   getLiveOwnerStatus,
@@ -16,6 +20,7 @@ export type LiveSchedulerOutcome =
   | "not-production"
   | "master-disarmed"
   | "triangle-disabled"
+  | "engines-disabled"
   | "risk-blocked"
   | "owner-not-held"
   | "in-flight"
@@ -31,6 +36,7 @@ export type LiveSchedulerEvent = {
   httpStatus?: number;
   code?: string;
   detail?: string;
+  strategy?: RiskStrategy;
 };
 
 export type LiveSchedulerStatus = {
@@ -69,6 +75,8 @@ export type LiveSchedulerDependencies = {
   getOwnerStatus(): Promise<PublicLiveOwnerStatus>;
   assertOwner(): Promise<unknown>;
   executeTriangle(request: Request): Promise<Response>;
+  discoverStrategySignals?(): Promise<StrategySignal[]>;
+  executeStrategy?(kind: StrategyKind, signalId: string): Promise<Response>;
 };
 
 type SchedulerGlobal = typeof globalThis & {
@@ -90,6 +98,21 @@ const defaultDependencies: LiveSchedulerDependencies = {
     // risk lease, fresh scan, orderbook revalidation and recovery hooks without
     // depending on a browser tab or a public HTTP round trip.
     const { POST } = await import("@/app/api/live/execute/route");
+    return POST(request);
+  },
+  discoverStrategySignals: async () => {
+    const settings = await getBotSettings();
+    const client = new NobitexClient();
+    const books = await client.getAllOrderBooks();
+    return (await scanConfiguredStrategies(books, settings, client)).signals;
+  },
+  executeStrategy: async (kind, signalId) => {
+    const request = internalStrategyRequest(kind, signalId);
+    if (kind === "cross-quote") {
+      const { POST } = await import("@/app/api/strategies/cross-quote/execute/route");
+      return POST(request);
+    }
+    const { POST } = await import("@/app/api/strategies/auto-execute/route");
     return POST(request);
   }
 };
@@ -172,22 +195,17 @@ export async function runLiveSchedulerTick(
     if (!snapshot.state.masterArmed) {
       return pushEvent(runtime, { at: now, outcome: "master-disarmed" });
     }
-    if (!snapshot.state.strategies.triangle.enabled) {
-      return pushEvent(runtime, { at: now, outcome: "triangle-disabled" });
-    }
-    if (!snapshot.evaluation.strategies.triangle.canExecute) {
+    const runnable = automaticStrategies(snapshot);
+    if (!runnable.length) {
+      const enabled = Object.values(snapshot.state.strategies).some(item => item.enabled);
       return pushEvent(runtime, {
         at: now,
-        outcome: "risk-blocked",
-        code: safeCode(snapshot.evaluation.strategies.triangle.blockers[0])
+        outcome: enabled ? "risk-blocked" : "engines-disabled",
+        code: enabled ? firstStrategyBlocker(snapshot) : undefined
       });
     }
 
-    const capability = STRATEGY_RUNTIME_CAPABILITIES.triangle;
-    if (!capability.automaticExecution || capability.scope !== "mainnet-only" || !capability.executionEndpoint) {
-      return pushEvent(runtime, { at: now, outcome: "risk-blocked", code: "triangle-runtime-unavailable" });
-    }
-
+    const triangleRunnable = runnable.includes("triangle");
     const owner = await dependencies.getOwnerStatus();
     if (!owner.heldByThisProcess) {
       return pushEvent(runtime, {
@@ -199,12 +217,39 @@ export async function runLiveSchedulerTick(
     // The status is informative; the token/record assertion is the actual fence.
     await dependencies.assertOwner();
 
-    const response = await dependencies.executeTriangle(internalTriangleRequest());
+    if (triangleRunnable) {
+      const response = await dependencies.executeTriangle(internalTriangleRequest());
+      const payload = await safePayload(response);
+      const outcome = response.ok ? responseOutcome(payload.status) : "rejected";
+      if (outcome !== "no-opportunity") {
+        return pushEvent(runtime, {
+          at: now,
+          outcome,
+          strategy: "triangle",
+          httpStatus: response.status,
+          code: safeCode(payload.code),
+          detail: safeDetail(payload.reason ?? payload.error)
+        });
+      }
+    }
+
+    const nonTriangle = new Set(runnable.filter(strategy => strategy !== "triangle"));
+    if (!nonTriangle.size || !dependencies.discoverStrategySignals || !dependencies.executeStrategy) {
+      return pushEvent(runtime, { at: now, outcome: "no-opportunity", strategy: triangleRunnable ? "triangle" : undefined });
+    }
+    const candidates = (await dependencies.discoverStrategySignals())
+      .filter(signal => signal.status === "actionable" && nonTriangle.has(signalRiskStrategy(signal.kind)))
+      .sort((left, right) => right.estimatedNetProfitToman.comparedTo(left.estimatedNetProfitToman));
+    const candidate = candidates[0];
+    if (!candidate) return pushEvent(runtime, { at: now, outcome: "no-opportunity" });
+
+    const strategy = signalRiskStrategy(candidate.kind);
+    const response = await dependencies.executeStrategy(candidate.kind, candidate.id);
     const payload = await safePayload(response);
-    const outcome = response.ok ? responseOutcome(payload.status) : "rejected";
     return pushEvent(runtime, {
       at: now,
-      outcome,
+      outcome: response.ok ? responseOutcome(payload.status) : "rejected",
+      strategy,
       httpStatus: response.status,
       code: safeCode(payload.code),
       detail: safeDetail(payload.reason ?? payload.error)
@@ -289,13 +334,57 @@ function internalTriangleRequest() {
   });
 }
 
+function internalStrategyRequest(kind: StrategyKind, signalId: string) {
+  return new Request("http://nobitex-internal/api/strategies/auto-execute", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      host: "nobitex-internal",
+      origin: "http://nobitex-internal",
+      "x-strategy-action": "nobitex-dashboard"
+    },
+    body: JSON.stringify(kind === "cross-quote" ? { signalId } : { kind, signalId })
+  });
+}
+
+function signalRiskStrategy(kind: StrategyKind): Exclude<RiskStrategy, "triangle"> {
+  if (kind === "cross-quote") return "crossQuote";
+  if (kind === "statistical-pairs") return "pairs";
+  if (kind === "stablecoin") return "stablecoin";
+  if (kind === "orderbook-gap") return "gapTrading";
+  return "imbalance";
+}
+
+function automaticStrategies(snapshot: Awaited<ReturnType<typeof getRiskControlSnapshot>>) {
+  return (Object.keys(STRATEGY_RUNTIME_CAPABILITIES) as RiskStrategy[]).filter(strategy => {
+    const state = snapshot.state.strategies[strategy];
+    const evaluation = snapshot.evaluation.strategies[strategy];
+    const capability = STRATEGY_RUNTIME_CAPABILITIES[strategy];
+    return state?.enabled
+      && evaluation?.canExecute
+      && capability.scope === "mainnet-only"
+      && capability.automaticExecution
+      && Boolean(capability.executionEndpoint);
+  });
+}
+
+function firstStrategyBlocker(snapshot: Awaited<ReturnType<typeof getRiskControlSnapshot>>) {
+  for (const strategy of Object.keys(STRATEGY_RUNTIME_CAPABILITIES) as RiskStrategy[]) {
+    if (!snapshot.state.strategies[strategy]?.enabled) continue;
+    const blocker = snapshot.evaluation.strategies[strategy]?.blockers[0];
+    if (blocker) return safeCode(blocker);
+  }
+  return undefined;
+}
+
 function normalizeInterval(value: number) {
   return Number.isFinite(value) ? Math.max(MIN_INTERVAL_MS, Math.floor(value)) : FALLBACK_INTERVAL_MS;
 }
 
 function responseOutcome(status: unknown): LiveSchedulerOutcome {
-  if (status === "executed") return "executed";
+  if (["executed", "completed", "recovered", "opened"].includes(String(status))) return "executed";
   if (status === "no-opportunity") return "no-opportunity";
+  if (status === "skipped" || status === "not-found") return "no-opportunity";
   if (status === "busy") return "busy";
   if (status === "rejected") return "rejected";
   return "no-opportunity";

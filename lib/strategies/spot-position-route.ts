@@ -24,6 +24,7 @@ import {
   type StrategyExecutionRecordLock
 } from "@/lib/strategy-execution-lock";
 import { scanOrderbookImbalance, scanStablecoinConvergence } from "./engine";
+import { scanOrderbookGaps } from "./orderbook-gap";
 import {
   createSpotPositionExecutionPlan,
   deserializeSpotPositionExecutionPlan,
@@ -95,6 +96,14 @@ export const defaultSpotPositionRouteDependencies: SpotPositionRouteDependencies
       maxAgeMs: settings.orderbookMaxAgeMs
     };
     if (kind === "stablecoin") return scanStablecoinConvergence(books, strategyConfig, now);
+    if (kind === "orderbook-gap") {
+      const gap = settings.strategyLab.gapTrading;
+      const orderbookHistory = recordOrderbookObservations(books, now, {
+        maxAgeMs: Math.max(gap.sampleWindowMs, gap.maxPersistenceMs) + 5_000,
+        maxSamples: Math.max(40, gap.minConfirmations * 4, gap.minOutcomeSamples * 3)
+      });
+      return scanOrderbookGaps(books, strategyConfig, now, { now, orderbookHistory });
+    }
     const imbalance = settings.strategyLab.imbalance;
     const orderbookHistory = recordOrderbookObservations(books, now, {
       maxAgeMs: Math.max(imbalance.sampleWindowMs, imbalance.maxPersistenceMs) + 5_000,
@@ -131,6 +140,34 @@ export const defaultSpotPositionRouteDependencies: SpotPositionRouteDependencies
         stablecoin: {
           minDeviationBps: strategy.minDeviationBps,
           exitDeviationBps: strategy.exitDeviationBps
+        }
+      }, now);
+    }
+    if (kind === "orderbook-gap") {
+      const strategy = settings.strategyLab.gapTrading;
+      return createSpotPositionExecutionPlan(signal, {
+        ...common,
+        capitalToman: strategy.capitalToman,
+        maxSpreadBps: strategy.maxSpreadBps,
+        maxPriceImpactBps: strategy.maxPriceImpactBps,
+        depthUsagePercent: strategy.depthUsagePercent,
+        orderReserveBps: strategy.orderReserveBps,
+        takeProfitBps: strategy.takeProfitBps,
+        stopLossBps: strategy.stopLossBps,
+        maxLossToman: strategy.maxLossToman,
+        maxResidualToman: strategy.maxResidualToman,
+        maxHoldMs: strategy.maxHoldMs,
+        pollIntervalMs: strategy.pollIntervalMs,
+        recoveryMaxSpreadBps: strategy.recoveryMaxSpreadBps,
+        recoveryMaxPriceImpactBps: strategy.recoveryMaxPriceImpactBps,
+        recoverySlippageBps: strategy.recoverySlippageBps,
+        gap: {
+          levels: strategy.levels,
+          baselineLevels: strategy.baselineLevels,
+          gapIndex: Number(signal.metrics.gapFromLevel) - 1,
+          minGapBps: strategy.minGapBps,
+          minGapZScore: strategy.minGapZScore,
+          minGapRatio: strategy.minGapRatio
         }
       }, now);
     }
@@ -192,11 +229,7 @@ export async function handleSpotPositionRequest(
   if (!isDashboardStrategyRequest(request)) {
     return NextResponse.json({ error: "Strategy execution is accepted only from this dashboard" }, { status: 403 });
   }
-  const inputSchema = z.object({
-    signalId: kind === "stablecoin"
-      ? z.string().trim().min(1).max(100).regex(/^stablecoin:[A-Z0-9_-]+$/i)
-      : z.string().trim().min(1).max(100).regex(/^imbalance:[A-Z0-9_-]+IRT$/i)
-  }).strict();
+  const inputSchema = z.object({ signalId: signalIdSchema(kind) }).strict();
   let input: z.infer<typeof inputSchema>;
   try { input = inputSchema.parse(await request.json()); } catch (error) {
     if (error instanceof z.ZodError) {
@@ -487,11 +520,7 @@ export async function handleSpotPositionRecoveryRequest(
   if (!isDashboardStrategyRequest(request)) {
     return NextResponse.json({ error: "Position recovery is accepted only from this dashboard" }, { status: 403 });
   }
-  const schema = z.object({
-    signalId: kind === "stablecoin"
-      ? z.string().trim().min(1).max(100).regex(/^stablecoin:[A-Z0-9_-]+$/i)
-      : z.string().trim().min(1).max(100).regex(/^imbalance:[A-Z0-9_-]+IRT$/i)
-  }).strict();
+  const schema = z.object({ signalId: signalIdSchema(kind) }).strict();
   let input: z.infer<typeof schema>;
   try { input = schema.parse(await request.json()); } catch (error) {
     if (error instanceof z.ZodError) return NextResponse.json({ error: "Recovery body accepts only signalId", issues: error.issues }, { status: 400 });
@@ -502,7 +531,7 @@ export async function handleSpotPositionRecoveryRequest(
     return NextResponse.json({ error: "Automatic persisted-position recovery requires official Mainnet", code: "MAINNET_REQUIRED" }, { status: 423 });
   }
 
-  const riskStrategy = kind === "stablecoin" ? "stablecoin" : "imbalance";
+  const riskStrategy = spotRiskStrategy(kind);
   let lease: ExecutionLease | undefined;
   let recordLock: StrategyExecutionRecordLock | undefined;
   let executionId: number | undefined;
@@ -773,9 +802,21 @@ function hostname(url: string) {
   try { return new URL(url).hostname.toLowerCase(); } catch { return ""; }
 }
 
+function spotRiskStrategy(kind: SpotPositionRouteKind) {
+  return kind === "stablecoin" ? "stablecoin" as const
+    : kind === "orderbook-gap" ? "gapTrading" as const
+      : "imbalance" as const;
+}
+
+function signalIdSchema(kind: SpotPositionRouteKind) {
+  if (kind === "stablecoin") return z.string().trim().min(1).max(100).regex(/^stablecoin:[A-Z0-9_-]+$/i);
+  if (kind === "orderbook-gap") return z.string().trim().min(1).max(120).regex(/^gap:[A-Z0-9_-]+IRT:ask:\d+$/i);
+  return z.string().trim().min(1).max(100).regex(/^imbalance:[A-Z0-9_-]+IRT$/i);
+}
+
 async function recordPnlOrStop(
   dependencies: Pick<SpotPositionRouteDependencies, "recordPnl" | "emergencyStop">,
-  strategy: "stablecoin" | "imbalance",
+  strategy: "stablecoin" | "gapTrading" | "imbalance",
   pnlToman: number
 ) {
   try {

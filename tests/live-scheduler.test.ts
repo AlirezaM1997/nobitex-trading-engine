@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import Decimal from "decimal.js";
 import {
   createLiveSchedulerRuntime,
   runLiveSchedulerTick,
@@ -106,5 +107,74 @@ describe("production Live scheduler", () => {
     expect(request?.headers.get("x-live-action")).toBe("nobitex-dashboard");
     expect(request?.headers.get("origin")).toBe("http://nobitex-internal");
     expect(await request?.json()).toEqual({});
+  });
+
+  test("delegates the best actionable signal when a non-Triangle engine is runnable", async () => {
+    let triangleCalls = 0;
+    let delegated: { kind: string; signalId: string } | undefined;
+    const runtime = createLiveSchedulerRuntime(0);
+    const event = await runLiveSchedulerTick(runtime, dependencies({
+      getRiskSnapshot: async () => ({
+        state: {
+          masterArmed: true,
+          strategies: {
+            triangle: { enabled: false },
+            stablecoin: { enabled: true },
+            imbalance: { enabled: false }
+          }
+        },
+        evaluation: {
+          strategies: {
+            triangle: { canExecute: false, blockers: ["strategy-disabled"] },
+            stablecoin: { canExecute: true, blockers: [] },
+            imbalance: { canExecute: false, blockers: ["strategy-disabled"] }
+          }
+        }
+      } as never),
+      executeTriangle: async () => {
+        triangleCalls += 1;
+        return Response.json({ status: "executed" });
+      },
+      discoverStrategySignals: async () => [
+        {
+          id: "ignored-imbalance",
+          kind: "orderbook-imbalance",
+          title: "ignored",
+          symbols: ["BTCIRT"],
+          action: "ignored",
+          status: "actionable",
+          paperOnly: true,
+          expectedEdgeBps: new Decimal(500),
+          estimatedNetProfitToman: new Decimal(50_000),
+          confidence: new Decimal(90),
+          reasons: [],
+          metrics: {},
+          scannedAt: 1_000
+        },
+        {
+          id: "stablecoin-best",
+          kind: "stablecoin",
+          title: "stablecoin",
+          symbols: ["USDTIRT"],
+          action: "buy",
+          status: "actionable",
+          paperOnly: true,
+          expectedEdgeBps: new Decimal(100),
+          estimatedNetProfitToman: new Decimal(10_000),
+          confidence: new Decimal(80),
+          reasons: [],
+          metrics: {},
+          scannedAt: 1_000
+        }
+      ],
+      executeStrategy: async (kind, signalId) => {
+        delegated = { kind, signalId };
+        return Response.json({ status: "completed", executionId: 12 });
+      }
+    }));
+
+    expect(event).toMatchObject({ outcome: "executed", strategy: "stablecoin", httpStatus: 200 });
+    expect(triangleCalls).toBe(0);
+    expect(delegated).toEqual({ kind: "stablecoin", signalId: "stablecoin-best" });
   });
 });

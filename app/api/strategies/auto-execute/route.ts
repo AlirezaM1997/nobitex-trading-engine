@@ -11,12 +11,14 @@ export const runtime = "nodejs";
 const inputSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("stablecoin"), signalId: z.string().trim().regex(/^stablecoin:[A-Z0-9_-]+$/i).max(100) }).strict(),
   z.object({ kind: z.literal("orderbook-imbalance"), signalId: z.string().trim().regex(/^imbalance:[A-Z0-9_-]+IRT$/i).max(100) }).strict(),
+  z.object({ kind: z.literal("orderbook-gap"), signalId: z.string().trim().regex(/^gap:[A-Z0-9_-]+IRT:ask:\d+$/i).max(120) }).strict(),
   z.object({ kind: z.literal("statistical-pairs"), signalId: z.string().trim().regex(/^pairs:[A-Z0-9_-]+:[A-Z0-9_-]+$/i).max(200) }).strict()
 ]);
 
 const executionPolicy = {
   stablecoin: { storeStrategy: "stablecoin" },
   "orderbook-imbalance": { storeStrategy: "imbalance" },
+  "orderbook-gap": { storeStrategy: "gapTrading" },
   "statistical-pairs": { storeStrategy: "pairs" }
 } as const;
 
@@ -46,6 +48,8 @@ export async function POST(request: Request) {
     ? settings.strategyLab.stablecoin.cooldownMs
     : input.kind === "orderbook-imbalance"
       ? settings.strategyLab.imbalance.cooldownMs
+      : input.kind === "orderbook-gap"
+        ? settings.strategyLab.gapTrading.cooldownMs
       : settings.strategyLab.pairs.cooldownMs;
   const recent = await findRecentStrategyExecution({
     strategy: policy.storeStrategy,
@@ -74,5 +78,7 @@ export async function POST(request: Request) {
     ? handleSpotPositionRequest(delegated, "stablecoin")
     : input.kind === "orderbook-imbalance"
       ? handleSpotPositionRequest(delegated, "orderbook-imbalance")
+      : input.kind === "orderbook-gap"
+        ? handleSpotPositionRequest(delegated, "orderbook-gap")
       : executeStatisticalPairs(delegated);
 }

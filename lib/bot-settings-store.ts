@@ -34,9 +34,36 @@ export async function getBotSettings(): Promise<BotSettings> {
  * replacement engine is always disabled so an upgrade cannot opt the user in.
  */
 export function migrateStoredStrategyLabSettings(input: unknown): unknown {
-  if (!isRecord(input) || isRecord(input.gapTrading) || !isRecord(input.marketMaking)) return input;
-  const legacy = input.marketMaking;
+  if (!isRecord(input)) return input;
   const defaults = defaultStrategyLabSettings.gapTrading;
+
+  if (isRecord(input.gapTrading)) {
+    const gap = input.gapTrading;
+    const calibrationFields = [
+      "predictionHorizonMs",
+      "minOutcomeSamples",
+      "minOutcomeHitRatePercent",
+      "minPredictedNetBps",
+      "forecastSafetyBps"
+    ];
+    if (calibrationFields.every(field => Object.prototype.hasOwnProperty.call(gap, field))) return input;
+
+    // Older Gap settings used a window too short to collect enough independent
+    // forward outcomes. Keep every explicit value, but lengthen only the two
+    // legacy timing limits needed by the calibrated live gate.
+    return {
+      ...input,
+      gapTrading: {
+        ...defaults,
+        ...gap,
+        sampleWindowMs: Math.max(positiveNumber(gap.sampleWindowMs) ?? 0, defaults.sampleWindowMs),
+        maxPersistenceMs: Math.max(positiveNumber(gap.maxPersistenceMs) ?? 0, defaults.maxPersistenceMs)
+      }
+    };
+  }
+
+  if (!isRecord(input.marketMaking)) return input;
+  const legacy = input.marketMaking;
   const legacyCapital = positiveNumber(legacy.orderSizeToman);
   const legacyDepth = positiveNumber(legacy.minVisibleDepthToman);
   const legacySpread = nonNegativeNumber(legacy.maxGrossSpreadBps);

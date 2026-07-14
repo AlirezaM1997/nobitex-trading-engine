@@ -5,6 +5,7 @@ import type { StrategySignal } from "@/lib/strategies/types";
 import {
   createSpotPositionExecutionPlan,
   executeSpotPosition,
+  revalidateSpotPositionEntry,
   SpotPositionExecutionError,
   type SpotPositionExecutionClient,
   type SpotPositionOrderRequest,
@@ -69,6 +70,54 @@ function imbalanceSignal(): StrategySignal {
   };
 }
 
+function gapSignal(): StrategySignal {
+  return {
+    id: "gap:XIRT:ask:2",
+    kind: "orderbook-gap",
+    title: "X ask liquidity gap",
+    symbols: ["XIRT"],
+    action: "BUY",
+    status: "actionable",
+    paperOnly: true,
+    expectedEdgeBps: new Decimal(200),
+    estimatedNetProfitToman: new Decimal(2_000),
+    confidence: new Decimal(75),
+    reasons: [],
+    metrics: {
+      direction: "LONG",
+      spotExecutable: true,
+      analyticalSetupPassed: true,
+      liveSetupPassed: true,
+      outcomeCalibrated: true,
+      temporalConfirmed: true,
+      gapBps: 1_600,
+      capitalToman: 100_000
+    },
+    scannedAt: startedAt
+  };
+}
+
+function gapBook(): OrderBook {
+  return {
+    symbol: "XIRT",
+    base: "X",
+    quote: "IRT",
+    lastUpdate: startedAt,
+    bids: [
+      { price: new Decimal(99), amount: new Decimal(10_000) },
+      { price: new Decimal(98), amount: new Decimal(10_000) },
+      { price: new Decimal(97), amount: new Decimal(10_000) },
+      { price: new Decimal(96), amount: new Decimal(10_000) }
+    ],
+    asks: [
+      { price: new Decimal(101), amount: new Decimal(10_000) },
+      { price: new Decimal(102), amount: new Decimal(10_000) },
+      { price: new Decimal(120), amount: new Decimal(10_000) },
+      { price: new Decimal(121), amount: new Decimal(10_000) }
+    ]
+  };
+}
+
 const common: Omit<SpotPositionPlanConfig, "stablecoin" | "imbalance"> = {
   capitalToman: 100_000,
   tomanTakerFeeBps: 0,
@@ -102,6 +151,13 @@ function imbalancePlan(overrides: Partial<NonNullable<SpotPositionPlanConfig["im
   return createSpotPositionExecutionPlan(imbalanceSignal(), {
     ...common,
     imbalance: { levels: 1, levelWeightDecayPercent: 70, minRatio: 2, exitRatio: 1.25, minVisibleDepthToman: 50_000, maxTopLevelSharePercent: 100, minMicropriceBiasBps: 0, ...overrides }
+  }, startedAt);
+}
+
+function gapPlan() {
+  return createSpotPositionExecutionPlan(gapSignal(), {
+    ...common,
+    gap: { levels: 4, baselineLevels: 4, gapIndex: 1, minGapBps: 500, minGapZScore: 3, minGapRatio: 4 }
   }, startedAt);
 }
 
@@ -162,6 +218,15 @@ function clock() {
 }
 
 describe("Mainnet Spot position executor", () => {
+  test("builds and freshly revalidates a calibrated Gap Trading plan", () => {
+    const plan = gapPlan();
+    const validation = revalidateSpotPositionEntry(plan, [gapBook()], startedAt);
+    expect(plan).toMatchObject({ strategy: "orderbook-gap", riskStrategy: "gapTrading", symbol: "XIRT" });
+    expect(plan.config.gapIndex).toBe(1);
+    expect(validation.metric.gte(500)).toBe(true);
+    expect(validation.entryQuote.output.gt(0)).toBe(true);
+  });
+
   test("creates a frozen, long-only, closed-to-IRT stablecoin plan", () => {
     const plan = stablePlan();
     expect(Object.isFrozen(plan)).toBe(true);

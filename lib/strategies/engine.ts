@@ -54,16 +54,17 @@ export function scanCrossQuoteInventory(books: OrderBook[], config: StrategyLabC
 
     const buyBaseIrt = quote("BUY", irt, settings.capitalToman, config.tomanTakerFeeBps, config.slippageBps, settings.depthUsagePercent);
     const sellBaseUsdt = buyBaseIrt && quote("SELL", usdt, buyBaseIrt.output, config.usdtTakerFeeBps, config.slippageBps, settings.depthUsagePercent);
-    if (sellBaseUsdt) {
-      const edge = sellBaseUsdt.output.div(benchmarkBuy.output).minus(1).mul(BPS);
-      signals.push(crossQuoteSignal(irt.base, "IRT → asset → USDT", [irt.symbol, usdt.symbol], edge, settings.capitalToman, spreadSafe, settings.minEdgeBps, now, spreads));
+    const closeUsdtIrt = sellBaseUsdt && quote("SELL", usdtIrt, sellBaseUsdt.output, config.tomanTakerFeeBps, config.slippageBps, settings.depthUsagePercent);
+    if (closeUsdtIrt) {
+      const edge = closeUsdtIrt.output.div(settings.capitalToman).minus(1).mul(BPS);
+      signals.push(crossQuoteSignal(irt.base, "IRT → asset → USDT → IRT", [irt.symbol, usdt.symbol], edge, settings.capitalToman, spreadSafe, settings.minEdgeBps, now, spreads));
     }
 
     const buyBaseUsdt = quote("BUY", usdt, benchmarkBuy.output, config.usdtTakerFeeBps, config.slippageBps, settings.depthUsagePercent);
     const sellBaseIrt = buyBaseUsdt && quote("SELL", irt, buyBaseUsdt.output, config.tomanTakerFeeBps, config.slippageBps, settings.depthUsagePercent);
     if (sellBaseIrt) {
       const edge = sellBaseIrt.output.div(settings.capitalToman).minus(1).mul(BPS);
-      signals.push(crossQuoteSignal(irt.base, "USDT → asset → IRT", [usdt.symbol, irt.symbol], edge, settings.capitalToman, spreadSafe, settings.minEdgeBps, now, spreads));
+      signals.push(crossQuoteSignal(irt.base, "IRT → USDT → asset → IRT", [usdt.symbol, irt.symbol], edge, settings.capitalToman, spreadSafe, settings.minEdgeBps, now, spreads));
     }
   }
   return signals.filter(item => item.expectedEdgeBps.gt(-50)).sort((a, b) => b.expectedEdgeBps.comparedTo(a.expectedEdgeBps)).slice(0, 20);
@@ -128,11 +129,18 @@ export function analyzeStatisticalPair(series: StatisticalPairSeries, config: St
     confidence: Decimal.min(100, Decimal.max(0, absZ.div(settings.entryZScore).mul(45)
       .plus(correlation.mul(20)).plus(modelReady ? 20 : 0))),
     reasons: stopBreached
+      ? ["Model stop threshold reached; new Live entry is blocked."]
+      : !modelReady
+        ? ["Stationarity, correlation or out-of-sample validation is not ready for Live entry."]
+        : actionable
+          ? ["Model validation and estimated net return passed the Live entry gates."]
+          : ["The model is valid, but deviation or net return has not reached the entry threshold."],
+    legacyReasons: stopBreached
       ? ["Z-Score به حد توقف مدل رسیده است؛ ورود جدید مجاز نیست."]
       : !modelReady
         ? ["آزمون پایداری، همبستگی یا اعتبارسنجی خارج از نمونه رد شده است."]
         : actionable
-          ? ["انحراف، پایداری مدل و بازده خالص برآوردی هم‌زمان تأیید شده‌اند.", "این سیگنال تا تکمیل کالیبراسیون فقط Shadow است."]
+          ? ["انحراف، پایداری مدل و بازده خالص برآوردی هم‌زمان تأیید شده‌اند.", "ورود واقعی همچنان تابع کنترل نقدشوندگی، ریسک و بازاعتبارسنجی لحظه‌ای است."]
           : ["مدل معتبر است، اما انحراف یا بازده خالص هنوز به آستانه ورود نرسیده است."],
     metrics: {
       zScore: z.toNumber(), beta: beta.toNumber(), correlation: correlation.toNumber(),
@@ -201,7 +209,16 @@ export function scanStablecoinConvergence(books: OrderBook[], config: StrategyLa
       estimatedNetProfitToman: Decimal.max(0, capital.mul(net).div(BPS)),
       confidence: Decimal.min(100, gross.div(settings.minDeviationBps || 1).mul(55)),
       reasons: actionable
-        ? ["خرید واقعی در عمق بازار و خروج فرضی در Parity پس از هزینه‌ها سود خالص کافی دارد.", "این موتور تا کالیبراسیون Depeg و زمان همگرایی فقط Shadow است."]
+        ? ["Long-only Spot entry, executable depth and projected net convergence passed the Live gates."]
+        : !longSpotExecutable
+          ? ["This direction needs a short position and cannot be opened from an IRT-funded Spot account."]
+          : !spreadSafe
+            ? ["The asset or reference market spread is above the configured limit."]
+            : !executionDepthSafe
+              ? ["Orderbook depth cannot fill both entry and immediate recovery for the configured capital safely."]
+              : ["Projected net return after costs has not reached the entry threshold."],
+      legacyReasons: actionable
+        ? ["خرید واقعی در عمق بازار و خروج فرضی در Parity پس از هزینه‌ها سود خالص کافی دارد.", "ورود واقعی همچنان تابع کنترل ریسک و بازاعتبارسنجی لحظه‌ای است."]
         : !longSpotExecutable
           ? ["این جهت به Short نیاز دارد و با موجودی Spot تومانی قابل اجرا نیست."]
           : !spreadSafe
@@ -347,12 +364,12 @@ export function scanOrderbookImbalance(books: OrderBook[], config: StrategyLabCo
       && executionDepthSafe
       && roundTripRiskSafe
       && outcomeCalibrated;
-    const reasons = actionable
+    const legacyReasons = actionable
       ? [
           `فشار خرید در ${confirmations} نمونه و ${persistenceMs} میلی‌ثانیه تأیید شده است`,
           "وزن سطوح نزدیک، Microprice و اثر قیمت اجرای واقعی هم‌جهت هستند",
           `کالیبراسیون ${realizedOutcomesBps.length} خروجی تاریخی، Hit Rate ${outcomeHitRatePercent.toFixed(1)}٪ و بازده خالص ${predictedNetBps.toFixed(2)} BPS را تأیید کرده است`,
-          "نقدینگی نمایشی می‌تواند لغو یا پنهان شود؛ سود تضمین‌شده نیست و این موتور فعلاً Shadow است."
+          "نقدینگی نمایشی می‌تواند لغو یا پنهان شود؛ سود تضمین‌شده نیست و سفارش فقط پس از بازاعتبارسنجی لحظه‌ای ارسال می‌شود."
         ]
       : [
           !longSpotExecutable
@@ -374,6 +391,33 @@ export function scanOrderbookImbalance(books: OrderBook[], config: StrategyLabCo
                           : `کالیبراسیون Shadow کافی نیست: ${realizedOutcomesBps.length}/${settings.minOutcomeSamples} نمونه، Hit Rate ${outcomeHitRatePercent.toFixed(1)}٪، بازده خالص محافظه‌کارانه ${predictedNetBps.toFixed(2)} BPS`,
           "تنها Snapshotهای جدید صرافی شمرده می‌شوند و اجرای واقعی تا اثبات بازده خارج از نمونه مسدود است."
         ];
+    const reasons = actionable
+      ? [
+          `Buy pressure persisted for ${confirmations} independent snapshots over ${persistenceMs} ms.`,
+          `Forward calibration passed with ${realizedOutcomesBps.length} outcomes, ${outcomeHitRatePercent.toFixed(1)}% hit rate and ${predictedNetBps.toFixed(2)} BPS conservative net return. Profit is not guaranteed.`
+        ]
+      : [
+          !longSpotExecutable
+            ? "Only IRT-quoted, bid-heavy Long Spot signals can execute."
+            : !persistenceSafe
+              ? `Persistence is incomplete: ${confirmations}/${settings.minConfirmations} snapshots over ${persistenceMs} ms.`
+              : !changePointSafe
+                ? "The orderbook pressure change point is below the configured threshold."
+                : !concentrationSafe
+                  ? "Top-level concentration failed the Spoofing/wall guard."
+                  : !micropriceSafe
+                    ? "Microprice does not confirm the signal direction."
+                    : !priceResponseSafe
+                      ? "Midpoint moved against the pressure signal; possible Absorption is blocking entry."
+                      : !executionDepthSafe
+                        ? "Executable depth or price impact is outside the configured limits."
+                        : !roundTripRiskSafe
+                          ? `Projected round-trip cost ${projectedRoundTripCostBps.toFixed(2)} BPS has no safe headroom below Stop Loss.`
+                          : !outcomeCalibrated
+                            ? `Forward calibration is incomplete: ${realizedOutcomesBps.length}/${settings.minOutcomeSamples} outcomes, ${outcomeHitRatePercent.toFixed(1)}% hit rate, ${predictedNetBps.toFixed(2)} BPS conservative net return.`
+                            : "One or more Live entry gates did not pass."
+        ];
+    void legacyReasons;
     const confidence = Decimal.min(90,
       Decimal.min(25, current.ratio.div(settings.minRatio).mul(18))
         .plus(Decimal.min(20, new Decimal(confirmations).div(Math.max(1, settings.minConfirmations)).mul(18)))
@@ -444,7 +488,7 @@ export function scanOrderbookImbalance(books: OrderBook[], config: StrategyLabCo
 function crossQuoteSignal(asset: string, action: string, symbols: string[], edge: Decimal, capital: number, spreadSafe: boolean, threshold: number, now: number, spreads: Decimal[]): StrategySignal {
   const actionable = edge.gte(threshold) && spreadSafe;
   return {
-    id: `cross:${asset}:${action.startsWith("IRT") ? "to-usdt" : "to-irt"}`,
+    id: `cross:${asset}:${symbols[0]?.endsWith("IRT") ? "to-usdt" : "to-irt"}`,
     kind: "cross-quote",
     title: `${asset} Cross-Quote Inventory`,
     symbols,
@@ -454,8 +498,8 @@ function crossQuoteSignal(asset: string, action: string, symbols: string[], edge
     expectedEdgeBps: edge,
     estimatedNetProfitToman: new Decimal(capital).mul(edge).div(BPS),
     confidence: Decimal.min(100, Decimal.max(0, edge).div(threshold || 1).mul(60)),
-    reasons: actionable ? ["مسیر دو سفارش نسبت به تبدیل مستقیم برتری دارد", "خروجی در معرض ریسک موجودی USDT/IRT است"] : [spreadSafe ? "برتری خالص هنوز به آستانه نرسیده است" : "اسپرد یکی از بازارها بیش از حد مجاز است"],
-    metrics: { capitalToman: capital, maxLegSpreadBps: Decimal.max(...spreads).toNumber(), fxExposure: true },
+    reasons: actionable ? ["چرخه بسته IRT با سه سفارش، پس از کارمزد و لغزش از آستانه عبور کرده است"] : [spreadSafe ? "بازده خالص چرخه بسته هنوز به آستانه نرسیده است" : "اسپرد یکی از بازارها بیش از حد مجاز است"],
+    metrics: { capitalToman: capital, maxLegSpreadBps: Decimal.max(...spreads).toNumber(), fxExposure: false, closedTomanCycle: true },
     scannedAt: now
   };
 }

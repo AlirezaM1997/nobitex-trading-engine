@@ -32,7 +32,12 @@ export async function scanConfiguredStrategies(books: OrderBook[], settings: Bot
         maxAgeMs: Math.max(...historyWindows) + 5_000,
         maxSamples: Math.max(
           40,
-          settings.strategyLab.gapTrading.enabled ? settings.strategyLab.gapTrading.minConfirmations * 4 : 0,
+          settings.strategyLab.gapTrading.enabled
+            ? Math.max(
+                settings.strategyLab.gapTrading.minConfirmations * 4,
+                settings.strategyLab.gapTrading.minOutcomeSamples * 3
+              )
+            : 0,
           settings.strategyLab.imbalance.enabled
             ? Math.max(
                 settings.strategyLab.imbalance.minConfirmations * 3,
