@@ -1,0 +1,52 @@
+import Decimal from "decimal.js";
+import type { StrategyLabSettings } from "@/lib/strategy-settings";
+import type { OrderbookObservation } from "./orderbook-history";
+
+export type StrategyKind = "cross-quote" | "statistical-pairs" | "stablecoin" | "orderbook-gap" | "orderbook-imbalance";
+export type StrategySignalStatus = "actionable" | "watch" | "blocked";
+
+export type StrategySignal = {
+  id: string;
+  kind: StrategyKind;
+  title: string;
+  symbols: string[];
+  action: string;
+  status: StrategySignalStatus;
+  paperOnly: true;
+  expectedEdgeBps: Decimal;
+  estimatedNetProfitToman: Decimal;
+  confidence: Decimal;
+  reasons: string[];
+  metrics: Record<string, string | number | boolean>;
+  scannedAt: number;
+};
+
+export type StatisticalPairSeries = {
+  assetA: string;
+  assetB: string;
+  pricesA: Decimal.Value[];
+  pricesB: Decimal.Value[];
+};
+
+export type StrategyLabConfig = {
+  settings: StrategyLabSettings;
+  tomanTakerFeeBps: number;
+  usdtTakerFeeBps: number;
+  slippageBps: number;
+  maxAgeMs: number;
+};
+
+export type StrategyLabContext = {
+  now?: number;
+  statisticalPairs?: StatisticalPairSeries[];
+  orderbookHistory?: ReadonlyMap<string, readonly OrderbookObservation[]>;
+};
+
+export type StrategyLabScanResult = {
+  scannedAt: number;
+  signals: StrategySignal[];
+  actionableCount: number;
+  watchCount: number;
+  enabledCount: number;
+  diagnostics: Record<string, string | number | boolean>;
+};
