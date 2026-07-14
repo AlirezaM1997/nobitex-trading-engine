@@ -1,8 +1,9 @@
 node_modules/
 .next/
 .next-verify-*/
-.env
-.env.local
+.env*
+!.env.example
+*.tsbuildinfo
 *.log
 coverage/
 data/*.sqlite
