@@ -1,20 +1,20 @@
 import Decimal from "decimal.js";
 import { config as appConfig } from "@/lib/config";
-import { bookSpreadBps, quoteEdge } from "@/lib/bot/engine";
+import { quoteEdge } from "@/lib/bot/engine";
 import type { LegQuote } from "@/lib/bot/types";
 import type { MarketOptions, NobitexOrder, OrderBook, Side } from "@/lib/exchanges/types";
 import type { StrategySignal } from "./types";
-import { measureOrderbookImbalance } from "./orderbook-imbalance";
+import type { IndependentAiMarketCandidate } from "@/lib/ai-agent/market-scanner";
+import { measureOrderbookImbalance, measureSnapshotOrderFlow } from "./orderbook-imbalance";
 import { measureAdjacentOrderbookGaps } from "./orderbook-gap";
 
 const BPS = new Decimal(10_000);
 const OFFICIAL_MAINNET_HOSTNAME = "apiv2.nobitex.ir";
 
-export type SpotPositionStrategy = "stablecoin" | "orderbook-gap" | "orderbook-imbalance";
-export type SpotPositionRiskStrategy = "stablecoin" | "gapTrading" | "imbalance";
+export type SpotPositionStrategy = "orderbook-gap" | "orderbook-imbalance" | "ai-autonomous";
+export type SpotPositionRiskStrategy = "gapTrading" | "imbalance" | "aiAgent";
 export type SpotPositionOrderStage = "entry" | "exit" | "recovery";
 export type SpotPositionExitReason =
-  | "convergence"
   | "imbalance-normalized"
   | "gap-consumed"
   | "take-profit"
@@ -64,10 +64,6 @@ export type SpotPositionPlanConfig = {
   recoveryMaxSpreadBps: Decimal.Value;
   recoveryMaxPriceImpactBps: Decimal.Value;
   recoverySlippageBps: Decimal.Value;
-  stablecoin?: {
-    minDeviationBps: Decimal.Value;
-    exitDeviationBps: Decimal.Value;
-  };
   imbalance?: {
     levels: number;
     levelWeightDecayPercent: Decimal.Value;
@@ -76,14 +72,19 @@ export type SpotPositionPlanConfig = {
     minVisibleDepthToman: Decimal.Value;
     maxTopLevelSharePercent: Decimal.Value;
     minMicropriceBiasBps: Decimal.Value;
+    minOrderFlowImbalance?: Decimal.Value;
+    minLiquidityRetentionPercent?: Decimal.Value;
   };
   gap?: {
     levels: number;
     baselineLevels: number;
+    levelWeightDecayPercent?: Decimal.Value;
     gapIndex: number;
     minGapBps: Decimal.Value;
     minGapZScore: Decimal.Value;
     minGapRatio: Decimal.Value;
+    minOrderFlowImbalance?: Decimal.Value;
+    minLiquidityRetentionPercent?: Decimal.Value;
   };
 };
 
@@ -118,8 +119,6 @@ export type SpotPositionExecutionPlan = Readonly<{
     recoveryMaxSpreadBps: Decimal;
     recoveryMaxPriceImpactBps: Decimal;
     recoverySlippageBps: Decimal;
-    minDeviationBps: Decimal | null;
-    exitDeviationBps: Decimal | null;
     imbalanceLevels: number | null;
     imbalanceLevelWeightDecayPercent: Decimal | null;
     minImbalanceRatio: Decimal | null;
@@ -127,8 +126,11 @@ export type SpotPositionExecutionPlan = Readonly<{
     minVisibleDepthToman: Decimal | null;
     maxTopLevelSharePercent: Decimal | null;
     minMicropriceBiasBps: Decimal | null;
+    minEntryOrderFlowImbalance: Decimal;
+    minEntryLiquidityRetentionPercent: Decimal;
     gapLevels: number | null;
     gapBaselineLevels: number | null;
+    gapLevelWeightDecayPercent: Decimal | null;
     gapIndex: number | null;
     minGapBps: Decimal | null;
     minGapZScore: Decimal | null;
@@ -287,13 +289,17 @@ export function serializeSpotPositionExecutionPlan(plan: SpotPositionExecutionPl
 export function deserializeSpotPositionExecutionPlan(input: unknown): SpotPositionExecutionPlan {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw invalidPlan("Persisted execution plan is missing");
   const value = input as Record<string, unknown>;
-  if (value.version !== 1 || !["stablecoin", "orderbook-gap", "orderbook-imbalance"].includes(String(value.strategy))) throw invalidPlan("Persisted execution plan has an invalid version or strategy");
+  if (value.version !== 1 || !["orderbook-gap", "orderbook-imbalance", "ai-autonomous"].includes(String(value.strategy))) throw invalidPlan("Persisted execution plan has an invalid version or strategy");
   const strategy = value.strategy as SpotPositionStrategy;
-  const riskStrategy = strategy === "stablecoin" ? "stablecoin" : strategy === "orderbook-gap" ? "gapTrading" : "imbalance";
+  const riskStrategy: SpotPositionRiskStrategy = strategy === "orderbook-gap"
+    ? "gapTrading"
+    : strategy === "ai-autonomous"
+      ? "aiAgent"
+      : "imbalance";
   if (value.riskStrategy !== riskStrategy || value.direction !== "LONG") throw invalidPlan("Persisted execution plan direction is invalid");
   const symbol = requiredString(value.symbol, "symbol").toUpperCase();
   const asset = requiredString(value.asset, "asset").toUpperCase();
-  if (symbol !== `${asset}IRT` || asset === "USDT") throw invalidPlan("Persisted execution market is invalid");
+  if (symbol !== `${asset}IRT` || (asset === "USDT" && strategy !== "ai-autonomous")) throw invalidPlan("Persisted execution market is invalid");
   const rawConfig = value.config;
   if (!rawConfig || typeof rawConfig !== "object" || Array.isArray(rawConfig)) throw invalidPlan("Persisted execution config is missing");
   const c = rawConfig as Record<string, unknown>;
@@ -323,30 +329,32 @@ export function deserializeSpotPositionExecutionPlan(input: unknown): SpotPositi
     recoveryMaxSpreadBps: boundedDecimal(String(c.recoveryMaxSpreadBps), 0, 10_000, "recoveryMaxSpreadBps"),
     recoveryMaxPriceImpactBps: boundedDecimal(String(c.recoveryMaxPriceImpactBps), 0, 10_000, "recoveryMaxPriceImpactBps"),
     recoverySlippageBps: boundedDecimal(String(c.recoverySlippageBps), 0, 2_000, "recoverySlippageBps"),
-    minDeviationBps: nullableDecimal("minDeviationBps"),
-    exitDeviationBps: nullableDecimal("exitDeviationBps"),
     imbalanceLevels: nullableInteger("imbalanceLevels"),
-    imbalanceLevelWeightDecayPercent: strategy === "orderbook-imbalance"
+    imbalanceLevelWeightDecayPercent: isImbalanceLike(strategy)
       ? boundedDecimal(String(c.imbalanceLevelWeightDecayPercent ?? 70), 10, 100, "imbalanceLevelWeightDecayPercent")
       : null,
     minImbalanceRatio: nullableDecimal("minImbalanceRatio"),
     exitImbalanceRatio: nullableDecimal("exitImbalanceRatio"),
     minVisibleDepthToman: nullableDecimal("minVisibleDepthToman"),
-    maxTopLevelSharePercent: strategy === "orderbook-imbalance"
+    maxTopLevelSharePercent: isImbalanceLike(strategy)
       ? boundedDecimal(String(c.maxTopLevelSharePercent ?? 100), 10, 100, "maxTopLevelSharePercent")
       : null,
-    minMicropriceBiasBps: strategy === "orderbook-imbalance"
+    minMicropriceBiasBps: isImbalanceLike(strategy)
       ? boundedDecimal(String(c.minMicropriceBiasBps ?? 0), 0, 500, "minMicropriceBiasBps")
       : null,
+    minEntryOrderFlowImbalance: boundedDecimal(String(c.minEntryOrderFlowImbalance ?? 0), 0, 2, "minEntryOrderFlowImbalance"),
+    minEntryLiquidityRetentionPercent: boundedDecimal(String(c.minEntryLiquidityRetentionPercent ?? 0), 0, 100, "minEntryLiquidityRetentionPercent"),
     gapLevels: strategy === "orderbook-gap" ? positiveInteger(Number(c.gapLevels), "gapLevels") : null,
     gapBaselineLevels: strategy === "orderbook-gap" ? positiveInteger(Number(c.gapBaselineLevels), "gapBaselineLevels") : null,
+    gapLevelWeightDecayPercent: strategy === "orderbook-gap"
+      ? boundedDecimal(String(c.gapLevelWeightDecayPercent ?? 70), 10, 100, "gapLevelWeightDecayPercent")
+      : null,
     gapIndex: strategy === "orderbook-gap" ? nonNegativeInteger(Number(c.gapIndex), "gapIndex") : null,
     minGapBps: strategy === "orderbook-gap" ? positiveDecimal(String(c.minGapBps), "minGapBps") : null,
     minGapZScore: strategy === "orderbook-gap" ? positiveDecimal(String(c.minGapZScore), "minGapZScore") : null,
     minGapRatio: strategy === "orderbook-gap" ? positiveDecimal(String(c.minGapRatio), "minGapRatio") : null
   });
-  if (strategy === "stablecoin" && (!config.minDeviationBps || !config.exitDeviationBps)) throw invalidPlan("Persisted Stablecoin exit config is incomplete");
-  if (strategy === "orderbook-imbalance" && (!config.imbalanceLevels || !config.imbalanceLevelWeightDecayPercent || !config.minImbalanceRatio || !config.exitImbalanceRatio || !config.minVisibleDepthToman || !config.maxTopLevelSharePercent || !config.minMicropriceBiasBps)) throw invalidPlan("Persisted Imbalance exit config is incomplete");
+  if (isImbalanceLike(strategy) && (!config.imbalanceLevels || !config.imbalanceLevelWeightDecayPercent || !config.minImbalanceRatio || !config.exitImbalanceRatio || !config.minVisibleDepthToman || !config.maxTopLevelSharePercent || !config.minMicropriceBiasBps)) throw invalidPlan("Persisted imbalance-style exit config is incomplete");
   if (strategy === "orderbook-gap" && (config.gapLevels === null || config.gapBaselineLevels === null || config.gapIndex === null || !config.minGapBps || !config.minGapZScore || !config.minGapRatio)) throw invalidPlan("Persisted Gap exit config is incomplete");
   return Object.freeze({
     id: requiredString(value.id, "id"),
@@ -356,7 +364,7 @@ export function deserializeSpotPositionExecutionPlan(input: unknown): SpotPositi
     riskStrategy,
     symbol,
     asset,
-    referenceSymbol: strategy === "stablecoin" ? "USDTIRT" : null,
+    referenceSymbol: null,
     direction: "LONG",
     capitalToman: positiveDecimal(String(value.capitalToman), "capitalToman"),
     initialMetric: decimal(String(value.initialMetric), "initialMetric"),
@@ -371,15 +379,22 @@ export function createSpotPositionExecutionPlan(
   input: SpotPositionPlanConfig,
   now = Date.now()
 ): SpotPositionExecutionPlan {
-  const strategy: SpotPositionStrategy | undefined = signal.kind === "stablecoin"
-    ? "stablecoin"
-    : signal.kind === "orderbook-gap"
+  return buildSpotPositionExecutionPlan(signal, input, now, false);
+}
+
+function buildSpotPositionExecutionPlan(
+  signal: StrategySignal,
+  input: SpotPositionPlanConfig,
+  now: number,
+  allowUsdtAsset: boolean
+): SpotPositionExecutionPlan {
+  const strategy: SpotPositionStrategy | undefined = signal.kind === "orderbook-gap"
       ? "orderbook-gap"
     : signal.kind === "orderbook-imbalance"
       ? "orderbook-imbalance"
       : undefined;
   if (!strategy || signal.status !== "actionable") {
-    throw invalidPlan("Only an actionable Stablecoin, Orderbook Gap or Orderbook Imbalance signal can become a position plan");
+    throw invalidPlan("Only an actionable Orderbook Gap or Orderbook Imbalance signal can become a position plan");
   }
   if (signal.metrics.direction !== "LONG" || signal.metrics.spotExecutable !== true) {
     throw invalidPlan("The signal is not an IRT-funded long Spot position");
@@ -403,7 +418,7 @@ export function createSpotPositionExecutionPlan(
   const symbol = String(signal.symbols[0] ?? "").toUpperCase();
   if (!symbol.endsWith("IRT") || symbol.length <= 3) throw invalidPlan("The position market must be an asset/IRT Spot market");
   const asset = symbol.slice(0, -3);
-  if (asset === "USDT") throw invalidPlan("USDTIRT cannot be used as the position asset");
+  if (asset === "USDT" && !allowUsdtAsset) throw invalidPlan("USDTIRT cannot be used as this strategy's position asset");
 
   const capitalToman = positiveDecimal(input.capitalToman, "capitalToman");
   const maxLossToman = positiveDecimal(input.maxLossToman, "maxLossToman");
@@ -416,31 +431,22 @@ export function createSpotPositionExecutionPlan(
     throw invalidPlan("Position and order timeouts must fit inside the five-minute server lease");
   }
 
-  const stablecoin = strategy === "stablecoin" ? input.stablecoin : undefined;
   const imbalance = strategy === "orderbook-imbalance" ? input.imbalance : undefined;
   const gap = strategy === "orderbook-gap" ? input.gap : undefined;
-  if (strategy === "stablecoin" && !stablecoin) throw invalidPlan("Stablecoin exit settings are missing");
   if (strategy === "orderbook-imbalance" && !imbalance) throw invalidPlan("Imbalance exit settings are missing");
   if (strategy === "orderbook-gap" && !gap) throw invalidPlan("Gap exit settings are missing");
 
-  const minDeviationBps = stablecoin ? boundedDecimal(stablecoin.minDeviationBps, 0, 10_000, "minDeviationBps") : null;
-  const exitDeviationBps = stablecoin ? boundedDecimal(stablecoin.exitDeviationBps, 0, 10_000, "exitDeviationBps") : null;
-  if (minDeviationBps && exitDeviationBps && exitDeviationBps.gte(minDeviationBps)) {
-    throw invalidPlan("exitDeviationBps must be below minDeviationBps");
-  }
   const minImbalanceRatio = imbalance ? boundedDecimal(imbalance.minRatio, 1, 100, "minRatio") : null;
   const exitImbalanceRatio = imbalance ? boundedDecimal(imbalance.exitRatio, 1, 100, "exitRatio") : null;
   if (minImbalanceRatio && exitImbalanceRatio && exitImbalanceRatio.gte(minImbalanceRatio)) {
     throw invalidPlan("exitRatio must be below minRatio");
   }
 
-  const initialMetricRaw = strategy === "stablecoin"
-    ? signal.metrics.deviationBps
-    : strategy === "orderbook-gap"
+  const initialMetricRaw = strategy === "orderbook-gap"
       ? signal.metrics.gapBps
       : signal.metrics.ratio;
   if (typeof initialMetricRaw !== "number" && typeof initialMetricRaw !== "string") throw invalidPlan("Signal metric is missing");
-  const route = Object.freeze([symbol, ...(strategy === "stablecoin" ? ["USDTIRT"] : [])]);
+  const route = Object.freeze([symbol]);
   const config = Object.freeze({
     tomanTakerFeeBps: boundedDecimal(input.tomanTakerFeeBps, 0, 10_000, "tomanTakerFeeBps"),
     slippageBps: boundedDecimal(input.slippageBps, 0, 2_000, "slippageBps"),
@@ -460,8 +466,6 @@ export function createSpotPositionExecutionPlan(
     recoveryMaxSpreadBps: boundedDecimal(input.recoveryMaxSpreadBps, 0, 10_000, "recoveryMaxSpreadBps"),
     recoveryMaxPriceImpactBps: boundedDecimal(input.recoveryMaxPriceImpactBps, 0, 10_000, "recoveryMaxPriceImpactBps"),
     recoverySlippageBps: boundedDecimal(input.recoverySlippageBps, 0, 2_000, "recoverySlippageBps"),
-    minDeviationBps,
-    exitDeviationBps,
     imbalanceLevels: imbalance ? positiveInteger(imbalance.levels, "levels") : null,
     imbalanceLevelWeightDecayPercent: imbalance ? boundedDecimal(imbalance.levelWeightDecayPercent, 10, 100, "levelWeightDecayPercent") : null,
     minImbalanceRatio,
@@ -469,8 +473,21 @@ export function createSpotPositionExecutionPlan(
     minVisibleDepthToman: imbalance ? positiveDecimal(imbalance.minVisibleDepthToman, "minVisibleDepthToman") : null,
     maxTopLevelSharePercent: imbalance ? boundedDecimal(imbalance.maxTopLevelSharePercent, 10, 100, "maxTopLevelSharePercent") : null,
     minMicropriceBiasBps: imbalance ? boundedDecimal(imbalance.minMicropriceBiasBps, 0, 500, "minMicropriceBiasBps") : null,
+    minEntryOrderFlowImbalance: boundedDecimal(
+      imbalance?.minOrderFlowImbalance ?? gap?.minOrderFlowImbalance ?? 0,
+      0,
+      2,
+      "minEntryOrderFlowImbalance"
+    ),
+    minEntryLiquidityRetentionPercent: boundedDecimal(
+      imbalance?.minLiquidityRetentionPercent ?? gap?.minLiquidityRetentionPercent ?? 0,
+      0,
+      100,
+      "minEntryLiquidityRetentionPercent"
+    ),
     gapLevels: gap ? positiveInteger(gap.levels, "gap levels") : null,
     gapBaselineLevels: gap ? positiveInteger(gap.baselineLevels, "gap baseline levels") : null,
+    gapLevelWeightDecayPercent: gap ? boundedDecimal(gap.levelWeightDecayPercent ?? 70, 10, 100, "gap levelWeightDecayPercent") : null,
     gapIndex: gap ? nonNegativeInteger(gap.gapIndex, "gap index") : null,
     minGapBps: gap ? positiveDecimal(gap.minGapBps, "minGapBps") : null,
     minGapZScore: gap ? positiveDecimal(gap.minGapZScore, "minGapZScore") : null,
@@ -482,10 +499,10 @@ export function createSpotPositionExecutionPlan(
     signalId: signal.id,
     signalScannedAt: signal.scannedAt,
     strategy,
-    riskStrategy: strategy === "stablecoin" ? "stablecoin" : strategy === "orderbook-gap" ? "gapTrading" : "imbalance",
+    riskStrategy: strategy === "orderbook-gap" ? "gapTrading" : "imbalance",
     symbol,
     asset,
-    referenceSymbol: strategy === "stablecoin" ? "USDTIRT" : null,
+    referenceSymbol: null,
     direction: "LONG" as const,
     capitalToman,
     initialMetric: decimal(initialMetricRaw, "initialMetric"),
@@ -493,6 +510,70 @@ export function createSpotPositionExecutionPlan(
     createdAt: now,
     route
   } as SpotPositionExecutionPlan & { route: readonly string[] });
+}
+
+/**
+ * Builds the same durable IRT -> asset -> IRT lifecycle for a candidate that
+ * was derived directly from raw Nobitex books by the autonomous AI scanner.
+ * The adapter deliberately accepts no Gap/Imbalance StrategySignal.
+ */
+export function createAiSpotPositionExecutionPlan(
+  candidate: IndependentAiMarketCandidate,
+  input: SpotPositionPlanConfig,
+  now = Date.now()
+): SpotPositionExecutionPlan {
+  const symbol = candidate.symbol.toUpperCase();
+  if (!candidate.gatePassed || !candidate.executable || candidate.direction !== "LONG") {
+    throw invalidPlan("Only a fully gated executable autonomous-market candidate can become a Live position plan");
+  }
+  if (candidate.kind !== "autonomous-market" || candidate.source !== "independent-orderbook-scanner") {
+    throw invalidPlan("AI position plan requires independent raw-orderbook evidence");
+  }
+  if (candidate.id !== `ai-market:${symbol}` || !/^[A-Z0-9_-]+IRT$/.test(symbol)) {
+    throw invalidPlan("AI candidate identity does not match its IRT market");
+  }
+  if (!new Decimal(candidate.capitalToman).eq(positiveDecimal(input.capitalToman, "capitalToman"))) {
+    throw invalidPlan("AI candidate must be rescanned at the exact balance-capped execution capital");
+  }
+  if (!input.imbalance) throw invalidPlan("AI orderbook exit settings are missing");
+
+  // Reuse the proven immutable-plan validation and serialization surface, but
+  // replace its identity before the plan leaves this adapter. No engine signal
+  // is accepted by this function or persisted as AI evidence.
+  const validationSignal: StrategySignal = {
+    id: candidate.id,
+    kind: "orderbook-imbalance",
+    title: `Autonomous AI ${symbol}`,
+    symbols: [symbol],
+    action: "BUY",
+    status: "actionable",
+    paperOnly: true,
+    expectedEdgeBps: new Decimal(candidate.expectedEdgeBps),
+    estimatedNetProfitToman: new Decimal(candidate.estimatedNetProfitToman),
+    confidence: new Decimal(candidate.confidencePercent),
+    reasons: candidate.reasons,
+    metrics: {
+      ...candidate.metrics,
+      direction: "LONG",
+      spotExecutable: true,
+      ratio: candidate.metrics.imbalanceRatio,
+      temporalConfirmed: true,
+      spoofingGuardPassed: true,
+      priceConfirmationPassed: true,
+      executionDepthSafe: true
+    },
+    scannedAt: candidate.scannedAt
+  };
+  const validated = buildSpotPositionExecutionPlan(validationSignal, input, now, true);
+  return Object.freeze({
+    ...validated,
+    id: `spot-position:ai-autonomous:${candidate.id}:${candidate.scannedAt}`,
+    strategy: "ai-autonomous" as const,
+    riskStrategy: "aiAgent" as const,
+    signalId: candidate.id,
+    signalScannedAt: candidate.scannedAt,
+    initialMetric: new Decimal(candidate.metrics.imbalanceRatio)
+  });
 }
 
 export function revalidateSpotPositionEntry(
@@ -509,18 +590,7 @@ export function revalidateSpotPositionEntry(
 
   let metric: Decimal;
   let expectedNetEdgeBps: Decimal | null = null;
-  if (plan.strategy === "stablecoin") {
-    const reference = findBook(books, plan.referenceSymbol!);
-    assertFresh(reference, now, plan.config.maxAgeMs);
-    if (bookSpreadBps(reference).gt(plan.config.maxSpreadBps)) throw revalidationError("USDTIRT reference spread is above the configured limit");
-    metric = stablecoinDeviation(book, reference);
-    if (metric.gte(0)) throw revalidationError("The stablecoin is no longer below the USDT reference");
-    expectedNetEdgeBps = metric.neg().minus(plan.config.tomanTakerFeeBps.mul(2)).minus(plan.config.slippageBps.mul(2));
-    const required = plan.config.minDeviationBps!.plus(plan.config.liveSafetyBufferBps);
-    if (expectedNetEdgeBps.lt(required)) {
-      throw revalidationError(`Fresh stablecoin edge ${expectedNetEdgeBps.toFixed(2)} BPS is below ${required.toFixed(2)} BPS`);
-    }
-  } else if (plan.strategy === "orderbook-imbalance") {
+  if (isImbalanceLike(plan.strategy)) {
     const imbalance = orderbookImbalance(book, plan.config.imbalanceLevels!, plan.config.imbalanceLevelWeightDecayPercent!);
     metric = imbalance.ratio;
     if (!imbalance.bidHeavy || metric.lt(plan.config.minImbalanceRatio!)) {
@@ -559,11 +629,14 @@ export async function executeSpotPosition(
   const now = options.now ?? Date.now;
   const sleep = options.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
   const marketOptionsPromise = client.getMarketOptions();
-  const firstValidation = revalidateSpotPositionEntry(plan, await client.getAllOrderBooks(), now());
+  const firstBooks = await client.getAllOrderBooks();
+  const firstValidation = revalidateSpotPositionEntry(plan, firstBooks, now());
   await safeHook(() => hooks.onRevalidated?.({ phase: "entry-1", plan, validation: firstValidation }));
   const delay = Math.max(0, options.revalidationDelayMs ?? 250);
   if (delay) await sleep(delay);
-  const entryValidation = revalidateSpotPositionEntry(plan, await client.getAllOrderBooks(), now());
+  const entryBooks = await client.getAllOrderBooks();
+  const entryValidation = revalidateSpotPositionEntry(plan, entryBooks, now());
+  assertNoAdverseOrderFlowReversal(plan, firstBooks, entryBooks);
   await safeHook(() => hooks.onRevalidated?.({ phase: "entry-2", plan, validation: entryValidation }));
   const marketOptions = await marketOptionsPromise;
   assertMinimumOrder(entryValidation.entryQuote, marketOptions);
@@ -715,12 +788,7 @@ async function makeExitCheck(
   const pnlBps = pnl.div(entry.actualInput).mul(BPS);
   let metric: Decimal;
   let strategyExit: SpotPositionExitReason | undefined;
-  if (plan.strategy === "stablecoin") {
-    const reference = findBook(books, plan.referenceSymbol!);
-    assertFresh(reference, now, plan.config.maxAgeMs);
-    metric = stablecoinDeviation(book, reference);
-    if (metric.abs().lte(plan.config.exitDeviationBps!)) strategyExit = "convergence";
-  } else if (plan.strategy === "orderbook-imbalance") {
+  if (isImbalanceLike(plan.strategy)) {
     const imbalance = orderbookImbalance(book, plan.config.imbalanceLevels!, plan.config.imbalanceLevelWeightDecayPercent!);
     metric = imbalance.ratio;
     if (!imbalance.bidHeavy || metric.lte(plan.config.exitImbalanceRatio!)) strategyExit = "imbalance-normalized";
@@ -974,17 +1042,32 @@ function currentAskGap(book: OrderBook, plan: SpotPositionExecutionPlan) {
   }
 }
 
-function stablecoinDeviation(assetBook: OrderBook, referenceBook: OrderBook) {
-  const assetMid = midpoint(assetBook);
-  const referenceMid = midpoint(referenceBook);
-  if (!assetMid || !referenceMid) throw revalidationError("Stablecoin midpoint is unavailable");
-  return assetMid.div(referenceMid).minus(1).mul(BPS);
-}
-
-function midpoint(book: OrderBook) {
-  const bid = book.bids[0]?.price;
-  const ask = book.asks[0]?.price;
-  return bid && ask ? bid.plus(ask).div(2) : undefined;
+function assertNoAdverseOrderFlowReversal(
+  plan: SpotPositionExecutionPlan,
+  previousBooks: OrderBook[],
+  currentBooks: OrderBook[]
+) {
+  const previous = findBook(previousBooks, plan.symbol);
+  const current = findBook(currentBooks, plan.symbol);
+  const levels = isImbalanceLike(plan.strategy)
+    ? plan.config.imbalanceLevels!
+    : plan.config.gapLevels!;
+  const decay = isImbalanceLike(plan.strategy)
+    ? plan.config.imbalanceLevelWeightDecayPercent!
+    : plan.config.gapLevelWeightDecayPercent!;
+  let flow: ReturnType<typeof measureSnapshotOrderFlow>;
+  try {
+    flow = measureSnapshotOrderFlow(previous, current, levels, decay);
+  } catch (error) {
+    throw revalidationError(error instanceof Error ? error.message : "Entry order flow could not be revalidated");
+  }
+  if (flow.normalizedFlow.lt(plan.config.minEntryOrderFlowImbalance.neg())) {
+    throw revalidationError(`Order flow reversed before entry (${flow.normalizedFlow.toFixed(4)} N-OFI)`);
+  }
+  if (flow.bidLiquidityRetentionPercent.lt(plan.config.minEntryLiquidityRetentionPercent)
+    && flow.normalizedFlow.lt(plan.config.minEntryOrderFlowImbalance)) {
+    throw revalidationError(`Bid liquidity retention fell to ${flow.bidLiquidityRetentionPercent.toFixed(1)}% before entry`);
+  }
 }
 
 function findBook(books: OrderBook[], symbol: string) {
@@ -1152,6 +1235,9 @@ class OrderStateUnknownError extends Error {
 function protectedExpectedPrice(side: Side, averagePrice: Decimal, slippageBps: Decimal) {
   const tolerance = Decimal.min(slippageBps.div(BPS), "0.009");
   return side === "BUY" ? averagePrice.mul(new Decimal(1).plus(tolerance)).div("1.01") : averagePrice.mul(new Decimal(1).minus(tolerance)).div("0.99");
+}
+function isImbalanceLike(strategy: SpotPositionStrategy) {
+  return strategy === "orderbook-imbalance" || strategy === "ai-autonomous";
 }
 function floorStep(value: Decimal, step: Decimal) { return value.div(step).floor().mul(step); }
 function priceToStep(side: Side, value: Decimal, step: Decimal) {

@@ -177,6 +177,22 @@ export async function verifyExecutionLedger() {
   return { valid: true, checked, invalidEventId: null as number | null };
 }
 
+/** Permanently clears the immutable audit ledger through the guarded admin flow. */
+export async function purgeAllExecutionLedgerData() {
+  const { db } = await ledger();
+  const events = Number(db.exec("SELECT COUNT(*) FROM execution_events")[0]?.values[0]?.[0] ?? 0);
+  db.run("BEGIN IMMEDIATE");
+  try {
+    db.run("DELETE FROM execution_events");
+    db.run("DELETE FROM sqlite_sequence WHERE name = 'execution_events'");
+    db.run("COMMIT");
+  } catch (error) {
+    db.run("ROLLBACK");
+    throw error;
+  }
+  return { events, total: events };
+}
+
 function eventByIdempotencyKey(db: NativeDatabase, key: string) {
   const statement = db.prepare("SELECT * FROM execution_events WHERE idempotency_key = ?");
   statement.bind([key]);

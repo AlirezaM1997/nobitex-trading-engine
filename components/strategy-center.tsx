@@ -1,11 +1,11 @@
 "use client";
 
-import { Activity, BarChart3, CircleDollarSign, Gauge, Radio, Scale, ShieldAlert, SlidersHorizontal, Waves } from "lucide-react";
+import { Activity, Gauge, Radio, ShieldAlert, SlidersHorizontal, Waves } from "lucide-react";
 import type { StrategyLabSettings } from "@/lib/strategy-settings";
 
 export type SerializedStrategySignal = {
   id: string;
-  kind: "cross-quote" | "statistical-pairs" | "stablecoin" | "orderbook-gap" | "orderbook-imbalance";
+  kind: "orderbook-gap" | "orderbook-imbalance";
   title: string;
   symbols: string[];
   action: string;
@@ -37,14 +37,11 @@ type Props = {
   only?: StrategyWorkspaceKey;
 };
 
-export type StrategyWorkspaceKey = "crossQuote" | "pairs" | "stablecoin" | "gapTrading" | "imbalance";
+export type StrategyWorkspaceKey = "gapTrading" | "imbalance";
 
 const fa = (value: string | number, digits = 0) => new Intl.NumberFormat("fa-IR", { maximumFractionDigits: digits }).format(Number(value));
 const en = (value: number) => new Intl.NumberFormat("en-US", { maximumFractionDigits: 8 }).format(value);
 const labels = {
-  "cross-quote": "Cross-Quote",
-  "statistical-pairs": "Pairs Trading",
-  stablecoin: "Stablecoin Convergence",
   "orderbook-gap": "Orderbook Gap",
   "orderbook-imbalance": "Orderbook Imbalance"
 } as const;
@@ -58,28 +55,29 @@ function metricNumber(signal: SerializedStrategySignal, ...keys: string[]) {
 }
 
 function signalMetric(signal: SerializedStrategySignal) {
-  if (signal.kind === "statistical-pairs") return {
-    label: "Z-Score",
-    value: fa(signal.metrics.zScore as number, 3),
-    note: "سود از این snapshot قابل برآورد قطعی نیست",
-    directional: false
-  };
-  if (signal.kind === "orderbook-imbalance") return {
-    label: "Depth Ratio",
-    value: `${fa(signal.metrics.ratio as number, 2)}×`,
-    note: "سود از این snapshot قابل برآورد قطعی نیست",
-    directional: false
-  };
+  if (signal.kind === "orderbook-imbalance") {
+    const flow = metricNumber(signal, "directionalOrderFlow", "normalizedOrderFlow");
+    const retention = metricNumber(signal, "dominantLiquidityRetentionPercent");
+    const samples = metricNumber(signal, "orderFlowSampleCount");
+    return {
+      label: "Depth Ratio / MLOFI",
+      value: `${fa(signal.metrics.ratio as number, 2)}×${flow === null ? "" : ` · ${fa(flow, 4)}`}`,
+      note: `جریان ${samples === null ? "—" : fa(samples)} تغییر مستقل · ماندگاری نقدینگی ${retention === null ? "—" : `${fa(retention, 1)}٪`} · سود تضمین‌شده نیست`,
+      directional: false
+    };
+  }
   if (signal.kind === "orderbook-gap") {
     const gap = metricNumber(signal, "gapBps");
     const robustZ = metricNumber(signal, "robustGapZScore", "gapZScore", "robustZScore", "robustZ");
     const persistence = metricNumber(signal, "persistenceMs");
     const preGapConsumption = metricNumber(signal, "plannedPreGapConsumptionPercent", "preGapConsumptionPercent");
+    const flow = metricNumber(signal, "normalizedOrderFlow");
+    const retention = metricNumber(signal, "bidLiquidityRetentionPercent");
     const projectedNet = metricNumber(signal, "projectedNetBps", "projectedNetEdgeBps", "netEdgeBps") ?? Number(signal.expectedEdgeBps);
     return {
       label: "Gap / Robust Z",
       value: `${gap === null ? "—" : fa(gap, 2)} BPS${robustZ === null ? "" : ` · Z ${fa(robustZ, 2)}`}`,
-      note: `ماندگاری ${persistence === null ? "—" : `${fa(persistence)} ms`} · مصرف پیش از Gap ${preGapConsumption === null ? "—" : `${fa(preGapConsumption, 1)}٪`} · خالص مدل ${fa(projectedNet, 2)} BPS`,
+      note: `ماندگاری ${persistence === null ? "—" : `${fa(persistence)} ms`} · MLOFI ${flow === null ? "—" : fa(flow, 4)} · حفظ Bid ${retention === null ? "—" : `${fa(retention, 1)}٪`} · مصرف پیش از Gap ${preGapConsumption === null ? "—" : `${fa(preGapConsumption, 1)}٪`} · خالص مدل ${fa(projectedNet, 2)} BPS`,
       directional: true
     };
   }
@@ -107,7 +105,7 @@ export default function StrategyCenter({ settings, result, onChange, saving, sav
   const best = (kind: SerializedStrategySignal["kind"]) => grouped(kind).sort((a, b) => Number(b.expectedEdgeBps) - Number(a.expectedEdgeBps))[0];
   const gapSetups = grouped("orderbook-gap").filter(signal => signal.status === "watch" && signal.metrics.analyticalSetupPassed === true);
   const bestGapSetup = [...gapSetups].sort((a, b) => Number(b.expectedEdgeBps) - Number(a.expectedEdgeBps))[0];
-  const onlyKind = only && ({ crossQuote: "cross-quote", pairs: "statistical-pairs", stablecoin: "stablecoin", gapTrading: "orderbook-gap", imbalance: "orderbook-imbalance" } as const)[only];
+  const onlyKind = only && ({ gapTrading: "orderbook-gap", imbalance: "orderbook-imbalance" } as const)[only];
   const visibleSignals = result?.signals.filter(signal => !onlyKind || signal.kind === onlyKind) ?? [];
 
   return <section className={`strategy-center ${only ? `only-${only}` : ""}`} aria-labelledby="strategy-center-title">
@@ -117,67 +115,6 @@ export default function StrategyCenter({ settings, result, onChange, saving, sav
     </div>
 
     <div className="strategy-grid">
-      <StrategyCard anchor="strategy-cross-quote" icon={Scale} tone="blue" title="آربیتراژ موجودی دو بازار" english="Cross-Quote Inventory" family="Inventory Arbitrage" enabled={settings.crossQuote.enabled} onToggle={() => updateSection("crossQuote", { enabled: !settings.crossQuote.enabled })} count={grouped("cross-quote").length} best={best("cross-quote")} risks={["FX Exposure", "Inventory", "2 Orders"]}>
-        <SettingsBand tone="paper" title="اسکن و شبیه‌سازی Paper" description="این مقادیر سیگنال و اندازه‌گذاری را کنترل می‌کنند؛ مجوز Live جداگانه در Risk Center است."/>
-        <NumberField label="سرمایه محاسباتی" english="Paper Capital" unit="تومان" value={settings.crossQuote.capitalToman} help="افزایش آن مصرف عمق و ریسک Inventory را بیشتر می‌کند." onChange={capitalToman => updateSection("crossQuote", { capitalToman })}/>
-        <NumberField label="حداقل برتری" english="Minimum Edge" unit="BPS" value={settings.crossQuote.minEdgeBps} help="بیشتر: سیگنال کمتر و محافظه‌کارانه‌تر؛ کمتر: فرصت بیشتر با حاشیه خطای کمتر." onChange={minEdgeBps => updateSection("crossQuote", { minEdgeBps })}/>
-        <NumberField label="حداکثر اسپرد" english="Max Spread" unit="BPS" value={settings.crossQuote.maxSpreadBps} help="کمترکردن، بازارهای پرهزینه و کم‌عمق را سخت‌گیرانه‌تر حذف می‌کند." onChange={maxSpreadBps => updateSection("crossQuote", { maxSpreadBps })}/>
-        <NumberField label="عمق قابل اتکا" english="Usable Depth" unit="٪" value={settings.crossQuote.depthUsagePercent} help="درصد بالاتر به حجم نمایشی بیشتری اعتماد می‌کند و ریسک لغزش را بالا می‌برد." onChange={depthUsagePercent => updateSection("crossQuote", { depthUsagePercent })}/>
-      </StrategyCard>
-
-      <StrategyCard anchor="strategy-pairs" icon={BarChart3} tone="violet" title="معامله جفت آماری" english="Statistical Pairs" family="Relative Value" enabled={settings.pairs.enabled} onToggle={() => updateSection("pairs", { enabled: !settings.pairs.enabled })} count={grouped("statistical-pairs").length} best={best("statistical-pairs")} primaryLabel="Z-Score" primaryValue={best("statistical-pairs") ? fa(best("statistical-pairs")!.metrics.zScore as number, 3) : "—"} risks={["Model Drift", "Margin", "Liquidation"]}>
-        <SettingsBand tone="paper" title="مدل و سیگنال Paper" description="انتخاب جفت، پنجره آماری و آستانه‌های تشخیص؛ این کلیدها سفارشی ارسال نمی‌کنند."/>
-        <TextField label="دارایی A" value={settings.pairs.assetA} help="نماد دارایی اول مدل؛ هر دو دارایی باید بازار IRT و داده OHLC معتبر داشته باشند." onChange={assetA => updateSection("pairs", { assetA: assetA.toUpperCase() })}/>
-        <TextField label="دارایی B" value={settings.pairs.assetB} help="نماد دارایی دوم؛ موتور فقط وقتی اجرا می‌شود که ضلع Short در بازار تعهدی نیز مجاز باشد." onChange={assetB => updateSection("pairs", { assetB: assetB.toUpperCase() })}/>
-        <SelectField label="تایم‌فریم OHLC" value={settings.pairs.resolution} options={["15", "30", "60", "240", "D"]} help="تایم‌فریم کوتاه‌تر سیگنال سریع‌تر و پرنویزتر؛ بلندتر سیگنال کندتر و پایدارتر می‌دهد." onChange={resolution => updateSection("pairs", { resolution: resolution as StrategyLabSettings["pairs"]["resolution"] })}/>
-        <NumberField label="Lookback" english="Samples" unit="کندل" value={settings.pairs.lookback} help="پنجره بزرگ‌تر مدل را آرام‌تر و پایدارتر، ولی واکنش آن به تغییر رژیم را کندتر می‌کند." onChange={lookback => updateSection("pairs", { lookback })}/>
-        <NumberField label="آستانه ورود" english="Entry Z-Score" unit="Z" value={settings.pairs.entryZScore} help="بالاتر: انحراف نادرتر و سیگنال کمتر؛ پایین‌تر: ورود بیشتر با احتمال نویز بالاتر." onChange={entryZScore => updateSection("pairs", { entryZScore })}/>
-        <NumberField label="آستانه خروج" english="Exit Z-Score" unit="Z" value={settings.pairs.exitZScore} help="کوچک‌تر منتظر همگرایی کامل‌تر می‌ماند و زمان بازبودن پوزیشن را زیاد می‌کند." onChange={exitZScore => updateSection("pairs", { exitZScore })}/>
-        <NumberField label="توقف مدل" english="Stop Z-Score" unit="Z" value={settings.pairs.maxZScore} help="عبور از این مقدار شکست فرض Mean Reversion تلقی و خروج حفاظتی آغاز می‌شود." onChange={maxZScore => updateSection("pairs", { maxZScore })}/>
-        <NumberField label="ارزش اسمی پوزیشن" english="Position Notional" unit="تومان" value={settings.pairs.notionalToman} help="اندازه مجموع Long/Short است؛ افزایش آن اثر قیمت، نیاز مارجین و زیان بالقوه را زیاد می‌کند." onChange={notionalToman => updateSection("pairs", { notionalToman })}/>
-        <SettingsBand tone="live" title="حدود اجرای واقعی" description="این حدود در سفارش واقعی Spot/Margin، مانیتور و Recovery روی حساب اصلی اعمال می‌شوند؛ کنترل ریسک نیز مستقل است."/>
-        <NumberField label="اهرم" english="Leverage" unit="×" value={settings.pairs.leverage} help="اهرم بالاتر سود و زیان و خطر لیکوییدیشن را هم‌زمان زیاد می‌کند." onChange={leverage => updateSection("pairs", { leverage })}/>
-        <NumberField label="تلورانس هج" english="Hedge Tolerance" unit="BPS" value={settings.pairs.hedgeToleranceBps} help="کمتر: تطابق دو ضلع دقیق‌تر؛ بیشتر: Fill آسان‌تر ولی ریسک جهت‌دار بیشتر." onChange={hedgeToleranceBps => updateSection("pairs", { hedgeToleranceBps })}/>
-        <NumberField label="حداکثر تغییر نسبت هج" english="Max Beta Drift" unit="BPS" value={settings.pairs.maxBetaDriftBps} help="کمتر: توقف سریع‌تر هنگام Drift نسبت هج؛ بیشتر: تحمل مدل بالاتر و ریسک بیشتر." onChange={maxBetaDriftBps => updateSection("pairs", { maxBetaDriftBps })}/>
-        <NumberField label="حداقل نسبت مارجین" english="Minimum Margin Ratio" unit="×" value={settings.pairs.minMarginRatio} help="بالاتر: فاصله دفاعی بیشتر از لیکوییدیشن و خروج زودتر؛ پایین‌تر: تحمل نوسان بیشتر با ریسک لیکوییدیشن بالاتر." onChange={minMarginRatio => updateSection("pairs", { minMarginRatio })}/>
-        <NumberField label="حداقل فاصله تا لیکوییدیشن" english="Liquidation Buffer" unit="BPS" value={settings.pairs.minLiquidationBufferBps} help="بالاتر: مانیتور زودتر Position را می‌بندد؛ پایین‌تر: سرمایه مدت بیشتری باز می‌ماند اما حاشیه ایمنی کمتر می‌شود." onChange={minLiquidationBufferBps => updateSection("pairs", { minLiquidationBufferBps })}/>
-        <NumberField label="وقفه ورود مجدد" english="Execution Cooldown" unit="ms" value={settings.pairs.cooldownMs} help="بیشتر: از ورود دوباره سریع پس از خروج/خطا جلوگیری می‌کند؛ کمتر: واکنش سریع‌تر با ریسک تکرار یک رژیم نامعتبر." onChange={cooldownMs => updateSection("pairs", { cooldownMs })}/>
-        <NumberField label="حداکثر اسپرد ورود" english="Max Entry Spread" unit="BPS" value={settings.pairs.maxEntrySpreadBps} help="سقف پایین‌تر ورود در بازار پرهزینه را متوقف می‌کند." onChange={maxEntrySpreadBps => updateSection("pairs", { maxEntrySpreadBps })}/>
-        <NumberField label="حداکثر اثر قیمت" english="Max Price Impact" unit="BPS" value={settings.pairs.maxPriceImpactBps} help="کمتر: حجم محافظه‌کارانه‌تر و احتمال لغزش کمتر." onChange={maxPriceImpactBps => updateSection("pairs", { maxPriceImpactBps })}/>
-        <NumberField label="سهم اعتبارسنجی" english="Holdout Validation" unit="٪" value={settings.pairs.validationPercent} help="بخش انتهایی داده که در برازش استفاده نمی‌شود. افزایش آن آزمون خارج از نمونه را سخت‌گیرانه‌تر، اما داده آموزش را کمتر می‌کند." onChange={validationPercent => updateSection("pairs", { validationPercent })}/>
-        <NumberField label="حداقل همبستگی" english="Minimum Correlation" unit="ρ" value={settings.pairs.minCorrelation} help="مقدار بالاتر فقط جفت‌های هم‌رفتارتر را نگه می‌دارد؛ همبستگی به‌تنهایی Cointegration را ثابت نمی‌کند." onChange={minCorrelation => updateSection("pairs", { minCorrelation })}/>
-        <NumberField label="حداکثر نیمه‌عمر" english="Maximum Half-Life" unit="کندل" value={settings.pairs.maxHalfLifeBars} help="نیمه‌عمر بزرگ‌تر یعنی همگرایی کندتر و خواب سرمایه بیشتر. کم‌کردن آن مدل‌های کند را حذف می‌کند." onChange={maxHalfLifeBars => updateSection("pairs", { maxHalfLifeBars })}/>
-        <NumberField label="حد بحرانی ADF" english="ADF Critical Value" unit="t" value={settings.pairs.adfCriticalValue} help="باید منفی باشد؛ عدد منفی‌تر آزمون ایستایی را سخت‌گیرانه‌تر می‌کند." onChange={adfCriticalValue => updateSection("pairs", { adfCriticalValue })}/>
-        <NumberField label="حداکثر Drift خارج نمونه" english="Holdout Drift" unit="Z" value={settings.pairs.maxValidationDriftZ} help="کمترکردن آن تغییر رژیم بین آموزش و داده جدید را زودتر رد می‌کند." onChange={maxValidationDriftZ => updateSection("pairs", { maxValidationDriftZ })}/>
-        <NumberField label="هزینه رفت‌وبرگشت برآوردی" english="Round-Trip Cost" unit="BPS" value={settings.pairs.estimatedRoundTripCostBps} help="کارمزد، اسپرد، لغزش و هزینه دو ضلع را محافظه‌کارانه جمع می‌کند؛ کمترکردن بی‌دلیل سود کاذب می‌سازد." onChange={estimatedRoundTripCostBps => updateSection("pairs", { estimatedRoundTripCostBps })}/>
-        <NumberField label="حداقل بازده خالص مدل" english="Minimum Expected Net" unit="BPS" value={settings.pairs.minExpectedNetBps} help="پس از کسر هزینه رفت‌وبرگشت اعمال می‌شود. بالاتر: سیگنال کمتر با حاشیه مدل بیشتر." onChange={minExpectedNetBps => updateSection("pairs", { minExpectedNetBps })}/>
-        <NumberField label="حداکثر زمان نگهداری" english="Max Holding Time" unit="دقیقه" value={settings.pairs.maxHoldingMinutes} help="پس از این زمان مدل باید پوزیشن را ببندد؛ زمان بیشتر ریسک Model Drift را زیاد می‌کند." onChange={maxHoldingMinutes => updateSection("pairs", { maxHoldingMinutes })}/>
-        <NumberField label="مهلت سفارش" english="Order Timeout" unit="ms" value={settings.pairs.orderTimeoutMs} help="زمان بیشتر شانس Fill و هم‌زمان ریسک بازماندن یک ضلع را افزایش می‌دهد." onChange={orderTimeoutMs => updateSection("pairs", { orderTimeoutMs })}/>
-      </StrategyCard>
-
-      <StrategyCard anchor="strategy-stablecoin" icon={CircleDollarSign} tone="violet" title="همگرایی استیبل‌کوین" english="Stablecoin Convergence" family="Convergence" enabled={settings.stablecoin.enabled} onToggle={() => updateSection("stablecoin", { enabled: !settings.stablecoin.enabled })} count={grouped("stablecoin").length} best={best("stablecoin")} risks={["Depeg", "Issuer", "Short Availability"]}>
-        <SettingsBand tone="paper" title="تشخیص انحراف در Paper" description="دارایی‌ها و شرط تشخیص فرصت؛ فعال‌کردن این بخش فقط اسکن را روشن می‌کند."/>
-        <TextField label="دارایی‌ها" value={settings.stablecoin.assets} help="نمادها را با کاما جدا کنید؛ فقط دارایی دارای بازار Spot IRT و مسیر Long قابل اجرا وارد سفارش می‌شود." onChange={assets => updateSection("stablecoin", { assets })}/>
-        <NumberField label="حداقل انحراف ورود" english="Entry Deviation" unit="BPS" value={settings.stablecoin.minDeviationBps} help="بیشتر: فقط انحراف‌های بزرگ‌تر؛ کمتر: سیگنال بیشتر با حاشیه ضعیف‌تر." onChange={minDeviationBps => updateSection("stablecoin", { minDeviationBps })}/>
-        <NumberField label="انحراف خروج" english="Exit Deviation" unit="BPS" value={settings.stablecoin.exitDeviationBps} help="مقدار کمتر منتظر همگرایی کامل‌تر می‌ماند و زمان نگهداری را زیاد می‌کند." onChange={exitDeviationBps => updateSection("stablecoin", { exitDeviationBps })}/>
-        <NumberField label="سرمایه هر پوزیشن" english="Position Capital" unit="تومان" value={settings.stablecoin.capitalToman} help="هم در Paper و هم در اجرای واقعی Mainnet مبنای اندازه‌گذاری است؛ افزایش آن اثر قیمت و زیان بالقوه را زیاد می‌کند." onChange={capitalToman => updateSection("stablecoin", { capitalToman })}/>
-        <SettingsBand tone="live" title="ورود، خروج و Recovery واقعی" description="این حدود در سفارش واقعی، Position State، خروج و Recovery روی حساب اصلی اعمال می‌شوند."/>
-        <NumberField label="حداکثر اسپرد" english="Max Spread" unit="BPS" value={settings.stablecoin.maxSpreadBps} help="سقف کمتر از ورود در بازارهای پرهزینه جلوگیری می‌کند." onChange={maxSpreadBps => updateSection("stablecoin", { maxSpreadBps })}/>
-        <NumberField label="حداکثر اثر قیمت" english="Max Price Impact" unit="BPS" value={settings.stablecoin.maxPriceImpactBps} help="کمتر: اجرای کوچک‌تر و محافظه‌کارانه‌تر." onChange={maxPriceImpactBps => updateSection("stablecoin", { maxPriceImpactBps })}/>
-        <NumberField label="سهم مجاز از عمق" english="Usable Depth" unit="٪" value={settings.stablecoin.depthUsagePercent} help="بالاتر به عمق نمایشی بیشتری اتکا می‌کند و لغزش بالقوه را زیاد می‌کند." onChange={depthUsagePercent => updateSection("stablecoin", { depthUsagePercent })}/>
-        <NumberField label="حد سود" english="Take Profit" unit="BPS" value={settings.stablecoin.takeProfitBps} help="بالاتر سود هدف را زیاد می‌کند اما احتمال رسیدن به خروج کمتر می‌شود." onChange={takeProfitBps => updateSection("stablecoin", { takeProfitBps })}/>
-        <NumberField label="حد ضرر" english="Stop Loss" unit="BPS" value={settings.stablecoin.stopLossBps} help="عدد بزرگ‌تر فضای حرکت و زیان احتمالی بیشتری می‌دهد." onChange={stopLossBps => updateSection("stablecoin", { stopLossBps })}/>
-        <NumberField label="حداکثر زیان معامله" english="Max Loss" unit="تومان" value={settings.stablecoin.maxLossToman} help="Circuit Breaker محلی این پوزیشن؛ کمترکردن آن خروج زیان را سریع‌تر می‌کند." onChange={maxLossToman => updateSection("stablecoin", { maxLossToman })}/>
-        <NumberField label="حداکثر باقیمانده دارایی" english="Max Residual Value" unit="تومان" value={settings.stablecoin.maxResidualToman} help="اگر ارزش Dust احتمالی پس از کارمزد و گردکردن از این عدد بیشتر باشد، معامله پیش از خرید رد می‌شود." onChange={maxResidualToman => updateSection("stablecoin", { maxResidualToman })}/>
-        <NumberField label="حداکثر زمان نگهداری" english="Max Hold" unit="ms" value={settings.stablecoin.maxHoldMs} help="پس از این زمان خروج اجباری شروع می‌شود." onChange={maxHoldMs => updateSection("stablecoin", { maxHoldMs })}/>
-        <NumberField label="فاصله پایش" english="Poll Interval" unit="ms" value={settings.stablecoin.pollIntervalMs} help="کمتر: واکنش سریع‌تر و بار API بیشتر." onChange={pollIntervalMs => updateSection("stablecoin", { pollIntervalMs })}/>
-        <NumberField label="وقفه ورود مجدد" english="Execution Cooldown" unit="ms" value={settings.stablecoin.cooldownMs} help="بیشتر: از خرید مکرر همان Depeg جلوگیری می‌کند؛ کمتر: فرصت بیشتر با ریسک Overtrading." onChange={cooldownMs => updateSection("stablecoin", { cooldownMs })}/>
-        <NumberField label="رزرو سفارش" english="Order Reserve" unit="BPS" value={settings.stablecoin.orderReserveBps} help="بافر قیمت سفارش؛ بیشتر، Fill را آسان‌تر ولی قیمت اجرا را بدتر می‌کند." onChange={orderReserveBps => updateSection("stablecoin", { orderReserveBps })}/>
-        <NumberField label="اسپرد مجاز Recovery" english="Recovery Max Spread" unit="BPS" value={settings.stablecoin.recoveryMaxSpreadBps} help="سقف اضطراری است؛ افزایش آن خروج را ممکن‌تر ولی پرهزینه‌تر می‌کند." onChange={recoveryMaxSpreadBps => updateSection("stablecoin", { recoveryMaxSpreadBps })}/>
-        <NumberField label="اثر قیمت Recovery" english="Recovery Max Impact" unit="BPS" value={settings.stablecoin.recoveryMaxPriceImpactBps} help="سقف اثر قیمت در بستن اضطراری پوزیشن." onChange={recoveryMaxPriceImpactBps => updateSection("stablecoin", { recoveryMaxPriceImpactBps })}/>
-        <NumberField label="لغزش Recovery" english="Recovery Slippage" unit="BPS" value={settings.stablecoin.recoverySlippageBps} help="بالاتر احتمال خروج اضطراری را زیاد و کیفیت قیمت را ضعیف‌تر می‌کند." onChange={recoverySlippageBps => updateSection("stablecoin", { recoverySlippageBps })}/>
-      </StrategyCard>
-
       <StrategyCard anchor="strategy-orderbook-gap" icon={Gauge} tone="amber" title="شکاف نقدشوندگی اردربوک" english="Orderbook Gap / Liquidity Vacuum" family="Market Microstructure" enabled={settings.gapTrading.enabled} onToggle={() => updateSection("gapTrading", { enabled: !settings.gapTrading.enabled })} count={gapSetups.length} best={bestGapSetup} primaryLabel="بزرگ‌ترین Gap معتبر" primaryValue={bestGapSetup ? `${fa(bestGapSetup.metrics.gapBps as number, 2)} BPS` : "—"} risks={["False Gap", "Ephemeral Liquidity", "Feed Latency"]}>
         <div className="gap-venue-grid">
           <div className="gap-venue available"><span>SPOT ORDERBOOK</span><b>اجرای واقعی با کالیبراسیون</b><p>ورود فقط پس از تأیید چند Snapshot، نتیجه‌های آینده همان الگو، عمق رفت‌وبرگشت و بازاعتبارسنجی دو مرحله‌ای انجام می‌شود.</p></div>
@@ -201,11 +138,14 @@ export default function StrategyCenter({ settings, result, onChange, saving, sav
           <NumberField label="حداکثر عمر سیگنال" english="Maximum Persistence" unit="ms" value={settings.gapTrading.maxPersistenceMs} help="Gap قدیمی ممکن است دیگر اطلاعات تازه‌ای نداشته باشد؛ کوتاه‌تر کردن این زمان سیگنال‌های stale را زودتر حذف می‌کند." onChange={maxPersistenceMs => updateSection("gapTrading", { maxPersistenceMs })}/>
           <NumberField label="حداکثر تغییر اندازه Gap" english="Maximum Gap Drift" unit="٪" value={settings.gapTrading.maxGapDriftPercent} help="اگر اندازه Gap بین نمونه‌ها بیش از این درصد تغییر کند، ساختار ناپایدار تلقی می‌شود. مقدار کمتر سخت‌گیرانه‌تر است." onChange={maxGapDriftPercent => updateSection("gapTrading", { maxGapDriftPercent })}/>
           <NumberField label="جابجایی مرز شکاف" english="Boundary Drift" unit="BPS" value={settings.gapTrading.maxBoundaryDriftBps} help="قیمت دو Level سازنده Gap نباید بیش از این مقدار جابه‌جا شود. سقف پایین‌تر، Gapهای ناپایدار را زودتر رد می‌کند." onChange={maxBoundaryDriftBps => updateSection("gapTrading", { maxBoundaryDriftBps })}/>
+          <NumberField label="حداقل تغییرات جریان" english="Flow Samples" unit="تغییر" value={settings.gapTrading.minFlowSamples} help="تعداد تغییر مستقل بین Snapshotها برای محاسبه MLOFI تقریبی. صفر این محافظ را خاموش می‌کند؛ مقدار بالاتر قابل‌اتکاتر ولی کندتر است." onChange={minFlowSamples => updateSection("gapTrading", { minFlowSamples })}/>
+          <NumberField label="حداقل جریان سفارش" english="Snapshot MLOFI" unit="N-OFI" value={settings.gapTrading.minOrderFlowImbalance} help="افزوده‌شدن Bid و حذف Ask را در چند Level و بین Snapshotها می‌سنجد. بیشتر، فقط جریان صعودی قوی‌تر را می‌پذیرد؛ این معیار با فید REST تقریب MLOFI است، نه رویداد کامل صرافی." onChange={minOrderFlowImbalance => updateSection("gapTrading", { minOrderFlowImbalance })}/>
           <NumberField label="حداقل حمایت سمت خرید" english="Bid Support Ratio" unit="×" value={settings.gapTrading.minBidSupportRatio} help="نسبت عمق وزنی Bid به Ask است. بالاتر، تأیید صعود قوی‌تر ولی فرصت کمتر ایجاد می‌کند." onChange={minBidSupportRatio => updateSection("gapTrading", { minBidSupportRatio })}/>
           <NumberField label="سوگیری Microprice" english="Microprice Bias" unit="BPS" value={settings.gapTrading.minMicropriceBiasBps} help="Microprice باید بالاتر از Mid باشد. افزایش آن ورودهای هم‌جهت‌تر و دیرتر می‌دهد." onChange={minMicropriceBiasBps => updateSection("gapTrading", { minMicropriceBiasBps })}/>
         </StrategySettingGroup>
 
         <StrategySettingGroup title="کیفیت نقدشوندگی و ضد دست‌کاری" english="LIQUIDITY QUALITY" description="شکاف مصنوعی، عمق متمرکز و مصرف بیش‌ازحد سطح قبل از Gap را حذف می‌کند.">
+          <NumberField label="حداقل ماندگاری نقدینگی Bid" english="Bid Liquidity Retention" unit="٪" value={settings.gapTrading.minBidLiquidityRetentionPercent} help="چه سهمی از سفارش‌های Bid قبلی روی همان قیمت باقی مانده است. مقدار بالاتر Wallهای زودگذر را بهتر حذف می‌کند، اما تغییر طبیعی اردربوک را هم سخت‌گیرانه‌تر می‌بیند." onChange={minBidLiquidityRetentionPercent => updateSection("gapTrading", { minBidLiquidityRetentionPercent })}/>
           <NumberField label="سقف تمرکز سطح اول" english="Top-Level Share" unit="٪" value={settings.gapTrading.maxTopLevelSharePercent} help="اگر بخش بزرگی از عمق فقط در یک Level باشد، ریسک Wall یا نقدینگی زودگذر بیشتر است. این معیار قصد Spoofing را اثبات نمی‌کند؛ مقدار کمتر سخت‌گیرانه‌تر است." onChange={maxTopLevelSharePercent => updateSection("gapTrading", { maxTopLevelSharePercent })}/>
           <NumberField label="حداکثر مصرف قبل از Gap" english="Pre-Gap Consumption" unit="٪" value={settings.gapTrading.maxPreGapConsumptionPercent} help="تخمین می‌زند ورود چه سهمی از نقدینگی پیش از شکاف را می‌خورد. مقدار کمتر اثر قیمت و خطر ایجاد حرکت توسط خود ربات را محدود می‌کند." onChange={maxPreGapConsumptionPercent => updateSection("gapTrading", { maxPreGapConsumptionPercent })}/>
           <NumberField label="حداقل عمق قابل مشاهده" english="Visible Depth" unit="تومان" value={settings.gapTrading.minVisibleDepthToman} help="افزایش آن بازارهای کم‌عمق را حذف می‌کند، ولی تعداد دارایی‌های قابل بررسی کاهش می‌یابد." onChange={minVisibleDepthToman => updateSection("gapTrading", { minVisibleDepthToman })}/>
@@ -257,6 +197,9 @@ export default function StrategyCenter({ settings, result, onChange, saving, sav
         <NumberField label="حداقل ماندگاری فشار" english="Min Persistence" unit="ms" value={settings.imbalance.minPersistenceMs} help="سیگنال باید حداقل این مدت باقی بماند. مقدار خیلی کم نسبت به سفارش‌های لحظه‌ای و Spoofing حساس است." onChange={minPersistenceMs => updateSection("imbalance", { minPersistenceMs })}/>
         <NumberField label="حداکثر عمر فشار" english="Max Persistence" unit="ms" value={settings.imbalance.maxPersistenceMs} help="پس از این زمان سیگنال قدیمی و احتمالاً جذب‌شده یا قیمت‌گذاری‌شده تلقی می‌شود. باید از حداقل ماندگاری بزرگ‌تر باشد." onChange={maxPersistenceMs => updateSection("imbalance", { maxPersistenceMs })}/>
         <NumberField label="حداقل جهش فشار" english="Change Point Delta" unit="NOBI" value={settings.imbalance.minPressureDelta} help="افزایش لازم در عدم‌تعادل نرمال‌شده/CUSUM نسبت به خط پایه. بیشتر: فقط تغییرات ناگهانی‌تر؛ کمتر: سیگنال‌های آرام‌تر و بیشتر." onChange={minPressureDelta => updateSection("imbalance", { minPressureDelta })}/>
+        <NumberField label="حداقل تغییرات جریان" english="Flow Samples" unit="تغییر" value={settings.imbalance.minFlowSamples} help="حداقل تعداد انتقال مستقل Snapshot برای تأیید جریان سفارش. صفر این محافظ را خاموش می‌کند؛ عدد بالاتر ورود را دیرتر ولی مقاوم‌تر می‌کند." onChange={minFlowSamples => updateSection("imbalance", { minFlowSamples })}/>
+        <NumberField label="حداقل جریان هم‌جهت" english="Snapshot MLOFI" unit="N-OFI" value={settings.imbalance.minOrderFlowImbalance} help="فقط زیادبودن حجم فعلی کافی نیست؛ تغییرات Bid/Ask در چند Level باید هم‌جهت باشد. مقدار بالاتر سیگنال کمتر و جریان قوی‌تر می‌دهد." onChange={minOrderFlowImbalance => updateSection("imbalance", { minOrderFlowImbalance })}/>
+        <NumberField label="حداقل ماندگاری سمت غالب" english="Liquidity Retention" unit="٪" value={settings.imbalance.minDominantLiquidityRetentionPercent} help="درصد نقدینگی سمت غالب که بین Snapshotها روی همان قیمت باقی می‌ماند. افزایش آن Wallهای لحظه‌ای را بیشتر رد می‌کند؛ مقدار خیلی بالا تغییر طبیعی بازار را هم حذف می‌کند." onChange={minDominantLiquidityRetentionPercent => updateSection("imbalance", { minDominantLiquidityRetentionPercent })}/>
         <NumberField label="سقف تمرکز Level اول" english="Top-Level Concentration" unit="٪" value={settings.imbalance.maxTopLevelSharePercent} help="اگر سهم دیوار Level اول از این مقدار بیشتر باشد، سیگنال برای کاهش ریسک Spoofing رد می‌شود. مقدار کمتر سخت‌گیرانه‌تر است." onChange={maxTopLevelSharePercent => updateSection("imbalance", { maxTopLevelSharePercent })}/>
         <NumberField label="حداقل تأیید Microprice" english="Microprice Bias" unit="BPS" value={settings.imbalance.minMicropriceBiasBps} help="Microprice باید حداقل به این اندازه جهت صعود را تأیید کند. بیشتر: ورود کمتر ولی هم‌جهتی قوی‌تر با Top of Book." onChange={minMicropriceBiasBps => updateSection("imbalance", { minMicropriceBiasBps })}/>
         <NumberField label="حرکت مخالف مجاز" english="Max Adverse Mid Move" unit="BPS" value={settings.imbalance.maxAdverseMoveBps} help="اگر قیمت میانی با وجود فشار Bid بیش از این مقدار افت کند، احتمال Absorption وجود دارد و ورود رد می‌شود. کمتر: فیلتر حساس‌تر؛ بیشتر: تحمل حرکت خلاف جهت." onChange={maxAdverseMoveBps => updateSection("imbalance", { maxAdverseMoveBps })}/>
@@ -306,7 +249,7 @@ export default function StrategyCenter({ settings, result, onChange, saving, sav
   </section>;
 }
 
-function StrategyCard({ anchor, icon: Icon, tone, title, english, family, enabled, onToggle, count, best, primaryLabel = "بهترین Edge", primaryValue, risks, children }: { anchor: string; icon: typeof Scale; tone: string; title: string; english: string; family: string; enabled: boolean; onToggle: () => void; count: number; best?: SerializedStrategySignal; primaryLabel?: string; primaryValue?: string; risks: string[]; children: React.ReactNode }) {
+function StrategyCard({ anchor, icon: Icon, tone, title, english, family, enabled, onToggle, count, best, primaryLabel = "بهترین Edge", primaryValue, risks, children }: { anchor: string; icon: typeof Activity; tone: string; title: string; english: string; family: string; enabled: boolean; onToggle: () => void; count: number; best?: SerializedStrategySignal; primaryLabel?: string; primaryValue?: string; risks: string[]; children: React.ReactNode }) {
   return <article id={anchor} className={`strategy-card ${tone} ${enabled ? "enabled" : "disabled"}`}>
     <header><div className="strategy-icon"><Icon/></div><div><span>{family}</span><h3>{title}<small>{english}</small></h3></div><button type="button" className={`mini-toggle ${enabled ? "on" : ""}`} onClick={onToggle} aria-pressed={enabled}>{enabled ? "اسکن Paper روشن" : "اسکن Paper خاموش"}</button></header>
     <div className="strategy-metrics"><div><span>سیگنال</span><b>{fa(count)}</b></div><div><span>{primaryLabel}</span><b>{primaryValue ?? (best ? `${fa(best.expectedEdgeBps, 2)} BPS` : "—")}</b></div><div><span>Confidence</span><b>{best ? `${fa(best.confidence, 1)}٪` : "—"}</b></div></div>
@@ -325,10 +268,4 @@ function StrategySettingGroup({ title, english, description, children }: { title
 
 function NumberField({ label, english, unit, value, help, onChange }: { label: string; english: string; unit: string; value: number; help?: string; onChange: (value: number) => void }) {
   return <label className="strategy-field"><span>{label}<small>{english}</small>{help && <i className="strategy-field-help">{help}</i>}</span><div><input type="text" inputMode="decimal" value={en(value)} onChange={event => { const parsed = Number(event.target.value.replace(/,/g, "")); if (Number.isFinite(parsed)) onChange(parsed); }}/><em>{unit}</em></div></label>;
-}
-function TextField({ label, value, help, onChange }: { label: string; value: string; help?: string; onChange: (value: string) => void }) {
-  return <label className="strategy-field"><span>{label}{help && <i className="strategy-field-help">{help}</i>}</span><div><input type="text" value={value} onChange={event => onChange(event.target.value)}/></div></label>;
-}
-function SelectField({ label, value, options, help, onChange }: { label: string; value: string; options: string[]; help?: string; onChange: (value: string) => void }) {
-  return <label className="strategy-field"><span>{label}{help && <i className="strategy-field-help">{help}</i>}</span><div><select value={value} onChange={event => onChange(event.target.value)}>{options.map(option => <option value={option} key={option}>{option}</option>)}</select></div></label>;
 }

@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { defaultStrategyLabSettings, strategyLabSettingsSchema } from "./strategy-settings";
+import { aiAgentSettingsSchema, defaultAiAgentSettings } from "./ai-agent/settings";
 
 export const botSettingsSchema = z.object({
   paperCapitalToman: z.coerce.number().positive().max(1_000_000_000_000_000),
@@ -17,7 +18,8 @@ export const botSettingsSchema = z.object({
   orderbookMaxAgeMs: z.coerce.number().int().min(1_000).max(300_000),
   scanIntervalMs: z.coerce.number().int().min(1_000).max(3_600_000),
   orderTimeoutMs: z.coerce.number().int().min(1_000).max(300_000),
-  strategyLab: strategyLabSettingsSchema.default(defaultStrategyLabSettings)
+  strategyLab: strategyLabSettingsSchema.default(defaultStrategyLabSettings),
+  aiAgent: aiAgentSettingsSchema.default(defaultAiAgentSettings)
 });
 
 export type BotSettings = z.infer<typeof botSettingsSchema>;
@@ -38,5 +40,6 @@ export const defaultBotSettings: BotSettings = {
   orderbookMaxAgeMs: 3_000,
   scanIntervalMs: 1_000,
   orderTimeoutMs: 5_000,
-  strategyLab: defaultStrategyLabSettings
+  strategyLab: defaultStrategyLabSettings,
+  aiAgent: defaultAiAgentSettings
 };

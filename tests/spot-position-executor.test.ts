@@ -25,24 +25,6 @@ function book(symbol: string, base: string, bid: number, ask: number, bidAmount 
   };
 }
 
-function stableSignal(): StrategySignal {
-  return {
-    id: "stablecoin:USDC",
-    kind: "stablecoin",
-    title: "USDC convergence",
-    symbols: ["USDCIRT", "USDTIRT"],
-    action: "Buy USDC / Sell USDT",
-    status: "actionable",
-    paperOnly: true,
-    expectedEdgeBps: new Decimal(800),
-    estimatedNetProfitToman: new Decimal(8_000),
-    confidence: new Decimal(80),
-    reasons: [],
-    metrics: { direction: "LONG", spotExecutable: true, deviationBps: -950, capitalToman: 100_000 },
-    scannedAt: startedAt
-  };
-}
-
 function imbalanceSignal(): StrategySignal {
   return {
     id: "imbalance:XIRT",
@@ -118,7 +100,7 @@ function gapBook(): OrderBook {
   };
 }
 
-const common: Omit<SpotPositionPlanConfig, "stablecoin" | "imbalance"> = {
+const common: Omit<SpotPositionPlanConfig, "imbalance"> = {
   capitalToman: 100_000,
   tomanTakerFeeBps: 0,
   slippageBps: 0,
@@ -140,13 +122,6 @@ const common: Omit<SpotPositionPlanConfig, "stablecoin" | "imbalance"> = {
   recoverySlippageBps: 100
 };
 
-function stablePlan() {
-  return createSpotPositionExecutionPlan(stableSignal(), {
-    ...common,
-    stablecoin: { minDeviationBps: 100, exitDeviationBps: 25 }
-  }, startedAt);
-}
-
 function imbalancePlan(overrides: Partial<NonNullable<SpotPositionPlanConfig["imbalance"]>> = {}) {
   return createSpotPositionExecutionPlan(imbalanceSignal(), {
     ...common,
@@ -162,8 +137,8 @@ function gapPlan() {
 }
 
 const marketOptions: MarketOptions = {
-  amountSteps: { USDCIRT: new Decimal("0.00000001"), XIRT: new Decimal("0.00000001") },
-  priceSteps: { USDCIRT: new Decimal("0.1"), XIRT: new Decimal("0.1") },
+  amountSteps: { XIRT: new Decimal("0.00000001") },
+  priceSteps: { XIRT: new Decimal("0.1") },
   minOrderRial: new Decimal(500_000),
   minOrderUsdt: new Decimal(11)
 };
@@ -194,7 +169,7 @@ class MockClient implements SpotPositionExecutionClient {
 }
 
 function filledOrder(request: SpotPositionOrderRequest, index: number): NobitexOrder {
-  const priceToman = request.side === "BUY" ? (request.base === "USDC" ? 91 : 100) : (request.base === "USDC" ? 101 : 102);
+  const priceToman = request.side === "BUY" ? 100 : 102;
   return {
     id: `order-${index + 1}`,
     status: "Done",
@@ -227,37 +202,22 @@ describe("Mainnet Spot position executor", () => {
     expect(validation.entryQuote.output.gt(0)).toBe(true);
   });
 
-  test("creates a frozen, long-only, closed-to-IRT stablecoin plan", () => {
-    const plan = stablePlan();
+  test("creates a frozen long-only plan and rejects an unconfirmed signal", () => {
+    const plan = imbalancePlan();
     expect(Object.isFrozen(plan)).toBe(true);
     expect(Object.isFrozen(plan.config)).toBe(true);
-    expect(plan).toMatchObject({ strategy: "stablecoin", riskStrategy: "stablecoin", symbol: "USDCIRT", direction: "LONG" });
-    const short = { ...stableSignal(), status: "blocked" as const, metrics: { ...stableSignal().metrics, direction: "SHORT", spotExecutable: false } };
-    expect(() => createSpotPositionExecutionPlan(short, { ...common, stablecoin: { minDeviationBps: 100, exitDeviationBps: 25 } })).toThrow();
+    expect(plan).toMatchObject({ strategy: "orderbook-imbalance", riskStrategy: "imbalance", symbol: "XIRT", direction: "LONG" });
     const unconfirmed = { ...imbalanceSignal(), metrics: { ...imbalanceSignal().metrics, temporalConfirmed: false } };
     expect(() => createSpotPositionExecutionPlan(unconfirmed, { ...common, imbalance: { levels: 1, levelWeightDecayPercent: 70, minRatio: 2, exitRatio: 1.25, minVisibleDepthToman: 50_000, maxTopLevelSharePercent: 100, minMicropriceBiasBps: 0 } })).toThrow();
   });
 
   test("rejects every hostname except the exact official Nobitex Mainnet host before reading a book", async () => {
     let reads = 0;
-    const client = new MockClient([[book("USDCIRT", "USDC", 90, 91), book("USDTIRT", "USDT", 100, 101)]]) as MockClient & { baseUrl: string };
+    const client = new MockClient([[book("XIRT", "X", 99, 100, 3_000, 1_000)]]) as MockClient & { baseUrl: string };
     client.baseUrl = "https://example.invalid";
     client.getAllOrderBooks = async () => { reads += 1; return []; };
-    await expect(executeSpotPosition(stablePlan(), client)).rejects.toMatchObject({ code: "MAINNET_REQUIRED" });
+    await expect(executeSpotPosition(imbalancePlan(), client)).rejects.toMatchObject({ code: "MAINNET_REQUIRED" });
     expect(reads).toBe(0);
-  });
-
-  test("opens an undervalued stablecoin and closes to IRT on convergence/take-profit", async () => {
-    const c = clock();
-    const entry = [book("USDCIRT", "USDC", 90, 91), book("USDTIRT", "USDT", 100, 101)];
-    const converged = [book("USDCIRT", "USDC", 101, 102, 10_000, 10_000, startedAt + 1_000), book("USDTIRT", "USDT", 101, 102, 10_000, 10_000, startedAt + 1_000)];
-    const client = new MockClient([entry, entry, converged]);
-    const result = await executeSpotPosition(stablePlan(), client, {}, { now: c.now, sleep: c.sleep, revalidationDelayMs: 0 });
-    expect(result.status).toBe("completed");
-    expect(["convergence", "take-profit"]).toContain(result.exitReason);
-    expect(result.outputToman.gt(result.inputToman)).toBe(true);
-    expect(result.residualAssetAmount.eq(0)).toBe(true);
-    expect(client.placed.map(value => value.side)).toEqual(["BUY", "SELL"]);
   });
 
   test("closes an imbalance position when the book normalizes", async () => {
@@ -283,6 +243,22 @@ describe("Mainnet Spot position executor", () => {
     );
     const client = new MockClient([[wall]]);
     await expect(executeSpotPosition(imbalancePlan({ levels: 3, maxTopLevelSharePercent: 70 }), client, {}, { revalidationDelayMs: 0 }))
+      .rejects.toMatchObject({ code: "REVALIDATION_FAILED" });
+    expect(client.placed).toHaveLength(0);
+  });
+
+  test("blocks entry when snapshot order flow reverses between the two live validations", async () => {
+    const first = [book("XIRT", "X", 99, 100, 3_000, 1_000)];
+    // Static depth remains bid-heavy, but both best prices step down and the
+    // former bid queue disappears: the transition is adverse despite ratio=3.
+    const reversed = [book("XIRT", "X", 98, 99, 3_000, 1_000)];
+    const client = new MockClient([first, reversed]);
+    const plan = imbalancePlan({
+      minOrderFlowImbalance: 0.03,
+      minLiquidityRetentionPercent: 60
+    });
+
+    await expect(executeSpotPosition(plan, client, {}, { revalidationDelayMs: 0 }))
       .rejects.toMatchObject({ code: "REVALIDATION_FAILED" });
     expect(client.placed).toHaveLength(0);
   });
@@ -394,14 +370,14 @@ describe("Mainnet Spot position executor", () => {
 
   test("a confirmed partial entry is immediately recovered to IRT", async () => {
     const c = clock();
-    const entryBooks = [book("USDCIRT", "USDC", 90, 91), book("USDTIRT", "USDT", 100, 101)];
+    const entryBooks = [book("XIRT", "X", 99, 100, 3_000, 1_000)];
     const client = new MockClient([entryBooks, entryBooks, entryBooks], (request, index) => {
       const complete = filledOrder(request, index);
       if (index > 0) return complete;
       const matched = request.amountBase.mul("0.75");
       return { ...complete, status: "Canceled", matchedAmount: matched, unmatchedAmount: request.amountBase.minus(matched), totalPrice: matched.mul(91).mul(10) };
     });
-    const result = await executeSpotPosition(stablePlan(), client, {}, { now: c.now, sleep: c.sleep, revalidationDelayMs: 0 });
+    const result = await executeSpotPosition(imbalancePlan(), client, {}, { now: c.now, sleep: c.sleep, revalidationDelayMs: 0 });
     expect(result.status).toBe("recovered");
     expect(result.exitReason).toBe("partial-entry");
     expect(client.placed.map(value => value.side)).toEqual(["BUY", "SELL"]);
@@ -409,11 +385,11 @@ describe("Mainnet Spot position executor", () => {
 
   test("a server stop still uses the wider recovery envelope when the normal exit spread is unsafe", async () => {
     const c = clock();
-    const entryBooks = [book("USDCIRT", "USDC", 90, 91), book("USDTIRT", "USDT", 100, 101)];
-    const unsafeNormalExit = [book("USDCIRT", "USDC", 90, 100), book("USDTIRT", "USDT", 100, 101)];
-    const recoveryBooks = [book("USDCIRT", "USDC", 90, 100)];
+    const entryBooks = [book("XIRT", "X", 99, 100, 3_000, 1_000)];
+    const unsafeNormalExit = [book("XIRT", "X", 90, 100, 1_000, 1_000, startedAt + 1_000)];
+    const recoveryBooks = [book("XIRT", "X", 90, 100, 1_000, 1_000, startedAt + 1_000)];
     const client = new MockClient([entryBooks, entryBooks, unsafeNormalExit, recoveryBooks]);
-    const result = await executeSpotPosition(stablePlan(), client, {
+    const result = await executeSpotPosition(imbalancePlan(), client, {
       onPositionCheck: () => "emergency-stop-active"
     }, { now: c.now, sleep: c.sleep, revalidationDelayMs: 0 });
     expect(result.status).toBe("recovered");
@@ -423,10 +399,10 @@ describe("Mainnet Spot position executor", () => {
 
   test("an ambiguous entry fails closed and never submits a speculative recovery SELL", async () => {
     const c = clock();
-    const books = [book("USDCIRT", "USDC", 90, 91), book("USDTIRT", "USDT", 100, 101)];
+    const books = [book("XIRT", "X", 99, 100, 3_000, 1_000)];
     const client = new MockClient([books, books], () => { throw new Error("socket timeout"); });
     try {
-      await executeSpotPosition(stablePlan(), client, {}, { now: c.now, sleep: c.sleep, revalidationDelayMs: 0 });
+      await executeSpotPosition(imbalancePlan(), client, {}, { now: c.now, sleep: c.sleep, revalidationDelayMs: 0 });
       throw new Error("expected rejection");
     } catch (error) {
       expect(error).toBeInstanceOf(SpotPositionExecutionError);
@@ -437,8 +413,8 @@ describe("Mainnet Spot position executor", () => {
 
   test("reconciles a timed-out Spot submission by clientOrderId before continuing", async () => {
     const c = clock();
-    const entry = [book("USDCIRT", "USDC", 90, 91), book("USDTIRT", "USDT", 100, 101)];
-    const converged = [book("USDCIRT", "USDC", 101, 102, 10_000, 10_000, startedAt + 1_000), book("USDTIRT", "USDT", 101, 102, 10_000, 10_000, startedAt + 1_000)];
+    const entry = [book("XIRT", "X", 99, 100, 3_000, 1_000)];
+    const converged = [book("XIRT", "X", 102, 103, 1_000, 1_000, startedAt + 1_000)];
     let submissions = 0;
     let lookups = 0;
     const client = new MockClient([entry, entry, converged], (request, index) => {
@@ -452,7 +428,7 @@ describe("Mainnet Spot position executor", () => {
       return filledOrder(client.placed[0]!, 0);
     };
 
-    const result = await executeSpotPosition(stablePlan(), client, {}, { now: c.now, sleep: c.sleep, revalidationDelayMs: 0 });
+    const result = await executeSpotPosition(imbalancePlan(), client, {}, { now: c.now, sleep: c.sleep, revalidationDelayMs: 0 });
     expect(result.status).toBe("completed");
     expect(result.legs.map(value => value.orderId)).toEqual(["order-1", "order-2"]);
     expect(lookups).toBe(1);

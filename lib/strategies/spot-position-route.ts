@@ -2,6 +2,10 @@ import { randomUUID } from "node:crypto";
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import Decimal from "decimal.js";
+import type { IndependentAiMarketCandidate } from "@/lib/ai-agent/market-scanner";
+import { scanAiMarketBooks } from "@/lib/ai-agent/scanner-service";
+import { selectAiLiveCandidate } from "@/lib/ai-agent/live-policy";
+import { recommendAiCapitalToman } from "@/lib/ai-agent/autopilot-profiles";
 import type { BotSettings } from "@/lib/bot-settings";
 import { getBotSettings } from "@/lib/bot-settings-store";
 import { config } from "@/lib/config";
@@ -23,10 +27,11 @@ import {
   releaseStrategyExecutionRecordLock,
   type StrategyExecutionRecordLock
 } from "@/lib/strategy-execution-lock";
-import { scanOrderbookImbalance, scanStablecoinConvergence } from "./engine";
+import { scanOrderbookImbalance } from "./engine";
 import { scanOrderbookGaps } from "./orderbook-gap";
 import {
   createSpotPositionExecutionPlan,
+  createAiSpotPositionExecutionPlan,
   deserializeSpotPositionExecutionPlan,
   executeSpotPosition,
   recoverKnownSpotExposure,
@@ -54,13 +59,20 @@ import {
 const OFFICIAL_MAINNET_HOSTNAME = "apiv2.nobitex.ir";
 
 export type SpotPositionRouteKind = SpotPositionStrategy;
+export type SpotPositionRouteCandidate = StrategySignal | IndependentAiMarketCandidate;
 
 export type SpotPositionRouteDependencies = {
   getSettings(): Promise<BotSettings>;
   apiBaseUrl(): string;
   createClient(): SpotPositionExecutionClient;
-  scan(kind: SpotPositionRouteKind, books: OrderBook[], settings: BotSettings, now: number): StrategySignal[];
-  createPlan(kind: SpotPositionRouteKind, signal: StrategySignal, settings: BotSettings, now: number): SpotPositionExecutionPlan;
+  getAvailableToman(client: SpotPositionExecutionClient): Promise<Decimal>;
+  scan(kind: SpotPositionRouteKind, books: OrderBook[], settings: BotSettings, now: number): SpotPositionRouteCandidate[];
+  createPlan(kind: SpotPositionRouteKind, signal: SpotPositionRouteCandidate, settings: BotSettings, now: number): SpotPositionExecutionPlan;
+  qualifyAiCandidate?(candidate: IndependentAiMarketCandidate, settings: BotSettings): Promise<{
+    qualified: boolean;
+    probability?: number;
+    blockers: string[];
+  }>;
   acquireLease: typeof acquireExecutionLease;
   acquireRecoveryLease: typeof acquireRecoveryLease;
   acquireRecordLock: typeof acquireStrategyExecutionRecordLock;
@@ -87,7 +99,17 @@ export const defaultSpotPositionRouteDependencies: SpotPositionRouteDependencies
   getSettings: getBotSettings,
   apiBaseUrl: () => config.NOBITEX_API_BASE,
   createClient: () => new NobitexClient(),
+  getAvailableToman: async client => {
+    // The production dependency always creates NobitexClient. Keeping the
+    // balance read injectable lets route tests stay exchange-independent while
+    // preserving one authenticated client for books, balance and orders.
+    const wallet = await (client as NobitexClient).getSpotTomanWallet();
+    return wallet.available;
+  },
   scan: (kind, books, settings, now) => {
+    if (kind === "ai-autonomous") {
+      return scanAiMarketBooks(books, settings, { now }).candidates;
+    }
     const strategyConfig: StrategyLabConfig = {
       settings: settings.strategyLab,
       tomanTakerFeeBps: settings.tomanTakerFeeBps,
@@ -95,7 +117,6 @@ export const defaultSpotPositionRouteDependencies: SpotPositionRouteDependencies
       slippageBps: settings.slippageBufferBps,
       maxAgeMs: settings.orderbookMaxAgeMs
     };
-    if (kind === "stablecoin") return scanStablecoinConvergence(books, strategyConfig, now);
     if (kind === "orderbook-gap") {
       const gap = settings.strategyLab.gapTrading;
       const orderbookHistory = recordOrderbookObservations(books, now, {
@@ -119,29 +140,52 @@ export const defaultSpotPositionRouteDependencies: SpotPositionRouteDependencies
       maxAgeMs: settings.orderbookMaxAgeMs,
       orderTimeoutMs: settings.orderTimeoutMs
     };
-    if (kind === "stablecoin") {
-      const strategy = settings.strategyLab.stablecoin;
-      return createSpotPositionExecutionPlan(signal, {
+    if (kind === "ai-autonomous") {
+      if (signal.kind !== "autonomous-market") {
+        throw new SpotPositionExecutionError("AI execution requires an autonomous-market candidate", "INVALID_PLAN");
+      }
+      const ai = settings.aiAgent;
+      const lifecycle = settings.strategyLab.imbalance;
+      if (ai.scannerMinImbalanceRatio <= 1) {
+        throw new SpotPositionExecutionError("AI Live requires Scanner Min Imbalance Ratio above 1", "INVALID_PLAN");
+      }
+      const exitRatio = Math.max(1, ai.scannerMinImbalanceRatio * 0.75);
+      const maxLossToman = Math.min(
+        lifecycle.maxLossToman,
+        ai.maxLiveCapitalToman
+      );
+      const maxResidualToman = Math.min(lifecycle.maxResidualToman, maxLossToman);
+      return createAiSpotPositionExecutionPlan(signal, {
         ...common,
-        capitalToman: strategy.capitalToman,
-        maxSpreadBps: strategy.maxSpreadBps,
-        maxPriceImpactBps: strategy.maxPriceImpactBps,
-        depthUsagePercent: strategy.depthUsagePercent,
-        orderReserveBps: strategy.orderReserveBps,
-        takeProfitBps: strategy.takeProfitBps,
-        stopLossBps: strategy.stopLossBps,
-        maxLossToman: strategy.maxLossToman,
-        maxResidualToman: strategy.maxResidualToman,
-        maxHoldMs: strategy.maxHoldMs,
-        pollIntervalMs: strategy.pollIntervalMs,
-        recoveryMaxSpreadBps: strategy.recoveryMaxSpreadBps,
-        recoveryMaxPriceImpactBps: strategy.recoveryMaxPriceImpactBps,
-        recoverySlippageBps: strategy.recoverySlippageBps,
-        stablecoin: {
-          minDeviationBps: strategy.minDeviationBps,
-          exitDeviationBps: strategy.exitDeviationBps
+        capitalToman: ai.maxLiveCapitalToman,
+        maxSpreadBps: ai.scannerMaxSpreadBps,
+        maxPriceImpactBps: ai.scannerMaxPriceImpactBps,
+        depthUsagePercent: ai.scannerDepthUsagePercent,
+        orderReserveBps: lifecycle.orderReserveBps,
+        takeProfitBps: ai.takeProfitBps,
+        stopLossBps: ai.stopLossBps,
+        maxLossToman,
+        maxResidualToman,
+        maxHoldMs: ai.maxHoldMs,
+        pollIntervalMs: lifecycle.pollIntervalMs,
+        recoveryMaxSpreadBps: lifecycle.recoveryMaxSpreadBps,
+        recoveryMaxPriceImpactBps: lifecycle.recoveryMaxPriceImpactBps,
+        recoverySlippageBps: lifecycle.recoverySlippageBps,
+        imbalance: {
+          levels: ai.scannerLevels,
+          levelWeightDecayPercent: ai.scannerLevelWeightDecayPercent,
+          minRatio: ai.scannerMinImbalanceRatio,
+          exitRatio,
+          minVisibleDepthToman: ai.scannerMinVisibleDepthToman,
+          maxTopLevelSharePercent: ai.scannerMaxTopLevelSharePercent,
+          minMicropriceBiasBps: ai.scannerMinMicropriceBiasBps,
+          minOrderFlowImbalance: ai.scannerMinOrderFlowImbalance,
+          minLiquidityRetentionPercent: ai.scannerMinLiquidityRetentionPercent
         }
       }, now);
+    }
+    if (signal.kind === "autonomous-market") {
+      throw new SpotPositionExecutionError("Engine execution cannot consume an autonomous AI candidate", "INVALID_PLAN");
     }
     if (kind === "orderbook-gap") {
       const strategy = settings.strategyLab.gapTrading;
@@ -164,10 +208,13 @@ export const defaultSpotPositionRouteDependencies: SpotPositionRouteDependencies
         gap: {
           levels: strategy.levels,
           baselineLevels: strategy.baselineLevels,
+          levelWeightDecayPercent: strategy.levelWeightDecayPercent,
           gapIndex: Number(signal.metrics.gapFromLevel) - 1,
           minGapBps: strategy.minGapBps,
           minGapZScore: strategy.minGapZScore,
-          minGapRatio: strategy.minGapRatio
+          minGapRatio: strategy.minGapRatio,
+          minOrderFlowImbalance: strategy.minOrderFlowImbalance,
+          minLiquidityRetentionPercent: strategy.minBidLiquidityRetentionPercent
         }
       }, now);
     }
@@ -195,9 +242,22 @@ export const defaultSpotPositionRouteDependencies: SpotPositionRouteDependencies
         exitRatio: strategy.exitRatio,
         minVisibleDepthToman: strategy.minVisibleDepthToman,
         maxTopLevelSharePercent: strategy.maxTopLevelSharePercent,
-        minMicropriceBiasBps: strategy.minMicropriceBiasBps
+        minMicropriceBiasBps: strategy.minMicropriceBiasBps,
+        minOrderFlowImbalance: strategy.minOrderFlowImbalance,
+        minLiquidityRetentionPercent: strategy.minDominantLiquidityRetentionPercent
       }
     }, now);
+  },
+  qualifyAiCandidate: async (candidate, settings) => {
+    const result = await selectAiLiveCandidate({
+      candidates: [candidate],
+      settings: settings.aiAgent
+    });
+    return {
+      qualified: result.selection?.candidate.id === candidate.id,
+      probability: result.selection?.probability,
+      blockers: result.blockers
+    };
   },
   acquireLease: acquireExecutionLease,
   acquireRecoveryLease,
@@ -251,19 +311,81 @@ export async function handleSpotPositionRequest(
   let executionId: number | undefined;
   let executionState: StrategyExecutionState | undefined;
   let exposed = false;
+  let aiProbability: number | undefined;
   try {
     // Prices, capital, limits and direction are always reconstructed from persisted server settings
     // and a fresh orderbook scan. The browser contributes only the signal identity.
     const settings = await dependencies.getSettings();
+    if (kind === "ai-autonomous" && (!settings.aiAgent.enabled || settings.aiAgent.mode !== "live")) {
+      return NextResponse.json({
+        error: "Autonomous AI Live execution is disabled in server settings",
+        code: "AI_LIVE_DISABLED"
+      }, { status: 423 });
+    }
     const client = dependencies.createClient();
     const scannedAt = dependencies.now();
     const books = await client.getAllOrderBooks();
-    const signal = dependencies.scan(kind, books, settings, scannedAt).find(candidate =>
-      candidate.id === input.signalId
-      && candidate.kind === kind
-      && candidate.status === "actionable"
-      && candidate.metrics.spotExecutable === true
-      && candidate.metrics.direction === "LONG"
+    // Reject a disappeared/stale signal before making the authenticated wallet
+    // call. If it still exists, the signal is scanned again at the final
+    // balance-capped size below; this first pass is never execution authority.
+    const preliminarySignal = findExecutableSpotSignal(
+      dependencies.scan(kind, books, settings, scannedAt),
+      kind,
+      input.signalId
+    );
+    if (!preliminarySignal) {
+      return NextResponse.json({
+        status: "rejected",
+        reason: "The requested signal is no longer an executable long Spot signal after a fresh server-side scan"
+      }, { status: 409 });
+    }
+
+    if (kind === "ai-autonomous") {
+      if (preliminarySignal.kind !== "autonomous-market") {
+        throw new SpotPositionExecutionError("Fresh AI scan returned an incompatible candidate", "INVALID_PLAN");
+      }
+      const qualification = await (dependencies.qualifyAiCandidate
+        ?? defaultSpotPositionRouteDependencies.qualifyAiCandidate!)(preliminarySignal, settings);
+      if (!qualification.qualified) {
+        return NextResponse.json({
+          status: "rejected",
+          reason: "The fresh candidate did not pass the locally trained AI Live policy",
+          blockers: qualification.blockers
+        }, { status: 409 });
+      }
+      aiProbability = qualification.probability;
+    }
+
+    const availableToman = await dependencies.getAvailableToman(client);
+    if (!availableToman.isFinite() || availableToman.lt(0)) {
+      throw new SpotPositionExecutionError("Available Spot IRT balance is invalid", "INVALID_PLAN");
+    }
+    const strategyCapitalToman = kind === "orderbook-gap"
+      ? settings.strategyLab.gapTrading.capitalToman
+      : kind === "ai-autonomous"
+        ? recommendAiCapitalToman({
+            maximumToman: settings.aiAgent.maxLiveCapitalToman,
+            probability: aiProbability ?? settings.aiAgent.minLiveConfidencePercent / 100,
+            minimumConfidencePercent: settings.aiAgent.minLiveConfidencePercent,
+            profile: settings.aiAgent.autopilotProfile
+          })
+        : settings.strategyLab.imbalance.capitalToman;
+    const capitalToman = Decimal.min(
+      strategyCapitalToman,
+      settings.maxTradeToman,
+      availableToman.mul(settings.balanceUsagePercent).div(100)
+    );
+    if (capitalToman.lte(0)) {
+      return NextResponse.json({
+        status: "rejected",
+        reason: "No usable free Spot IRT balance is available after server-side capital limits"
+      }, { status: 409 });
+    }
+    const executionSettings = withSpotCapital(settings, kind, capitalToman.toNumber());
+    const signal = findExecutableSpotSignal(
+      dependencies.scan(kind, books, executionSettings, scannedAt),
+      kind,
+      input.signalId
     );
     if (!signal) {
       return NextResponse.json({
@@ -271,7 +393,21 @@ export async function handleSpotPositionRequest(
         reason: "The requested signal is no longer an executable long Spot signal after a fresh server-side scan"
       }, { status: 409 });
     }
-    const plan = dependencies.createPlan(kind, signal, settings, scannedAt);
+    if (kind === "ai-autonomous") {
+      if (signal.kind !== "autonomous-market") {
+        throw new SpotPositionExecutionError("Fresh AI scan returned an incompatible candidate", "INVALID_PLAN");
+      }
+      const qualification = await (dependencies.qualifyAiCandidate ?? defaultSpotPositionRouteDependencies.qualifyAiCandidate!)(signal, executionSettings);
+      if (!qualification.qualified) {
+        return NextResponse.json({
+          status: "rejected",
+          reason: "The fresh candidate did not pass the locally trained AI Live policy",
+          blockers: qualification.blockers
+        }, { status: 409 });
+      }
+      aiProbability = qualification.probability;
+    }
+    const plan = dependencies.createPlan(kind, signal, executionSettings, scannedAt);
     const riskStrategy = plan.riskStrategy;
     const acquisition = await dependencies.acquireLease({
       strategy: riskStrategy,
@@ -289,11 +425,11 @@ export async function handleSpotPositionRequest(
 
     const record = await dependencies.createExecution({
       strategy: riskStrategy,
-      signalId: signal.id,
-      symbols: signal.symbols,
+      signalId: candidateId(signal),
+      symbols: candidateSymbols(signal),
       direction: "IRT -> asset -> IRT (long Spot)",
       requestedCapitalToman: plan.capitalToman.toNumber(),
-      plannedProfitToman: signal.estimatedNetProfitToman.toNumber(),
+      plannedProfitToman: candidateEstimatedProfit(signal).toNumber(),
       metadata: {
         planId: plan.id,
         executionPlan: serializeSpotPositionExecutionPlan(plan),
@@ -301,6 +437,7 @@ export async function handleSpotPositionRequest(
         signalScannedAt: signal.scannedAt,
         initialMetric: plan.initialMetric.toString(),
         entryEvidence: signal.metrics,
+        aiProbability,
         maxHoldMs: plan.config.maxHoldMs,
         stopLossBps: plan.config.stopLossBps.toString(),
         maxLossToman: plan.config.maxLossToman.toString(),
@@ -443,7 +580,7 @@ export async function handleSpotPositionRequest(
     });
     executionState = "CLOSED";
     exposed = result.residualAssetAmount.gt(0);
-    await recordPnlOrStop(dependencies, riskStrategy, result.profitToman.toNumber());
+    await recordPnlOrStop(dependencies, riskStrategy, executionId, result.profitToman.toNumber());
     if (result.profitToman.lt(0)) {
       await dependencies.emergencyStop(`${riskStrategy}-realized-loss-circuit-breaker`).catch(() => undefined);
     }
@@ -451,7 +588,7 @@ export async function handleSpotPositionRequest(
     return NextResponse.json({
       status: result.status,
       executionId,
-      signalId: signal.id,
+      signalId: candidateId(signal),
       strategy: riskStrategy,
       exitReason: result.exitReason,
       inputToman: result.inputToman.toString(),
@@ -592,7 +729,7 @@ export async function handleSpotPositionRecoveryRequest(
         metadata: { recoveryResume: "already-flat", pnlRecordedGlobally: true }
       });
       executionState = "CLOSED";
-      await recordPnlOrStop(dependencies, riskStrategy, profit.toNumber());
+      await recordPnlOrStop(dependencies, riskStrategy, executionId, profit.toNumber());
       if (profit.lt(0)) await dependencies.emergencyStop(`${riskStrategy}-recovery-realized-loss`).catch(() => undefined);
       return NextResponse.json({
         status: "already-flat",
@@ -671,7 +808,7 @@ export async function handleSpotPositionRecoveryRequest(
       }
     });
     executionState = "CLOSED";
-    await recordPnlOrStop(dependencies, riskStrategy, profitToman.toNumber());
+    await recordPnlOrStop(dependencies, riskStrategy, executionId, profitToman.toNumber());
     if (profitToman.lt(0)) await dependencies.emergencyStop(`${riskStrategy}-recovery-realized-loss`).catch(() => undefined);
     return NextResponse.json({
       status: "recovered",
@@ -798,34 +935,103 @@ export function isDashboardStrategyRequest(request: Request) {
   try { return new URL(origin).host.toLowerCase() === host.toLowerCase(); } catch { return false; }
 }
 
+function findExecutableSpotSignal(
+  signals: SpotPositionRouteCandidate[],
+  kind: SpotPositionRouteKind,
+  signalId: string
+) {
+  return signals.find(candidate => {
+    if (candidate.id !== signalId) return false;
+    if (kind === "ai-autonomous") {
+      return candidate.kind === "autonomous-market"
+        && candidate.source === "independent-orderbook-scanner"
+        && candidate.executable
+        && candidate.gatePassed
+        && candidate.direction === "LONG";
+    }
+    return candidate.kind === kind
+      && candidate.status === "actionable"
+      && candidate.metrics.spotExecutable === true
+      && candidate.metrics.direction === "LONG";
+  });
+}
+
 function hostname(url: string) {
   try { return new URL(url).hostname.toLowerCase(); } catch { return ""; }
 }
 
 function spotRiskStrategy(kind: SpotPositionRouteKind) {
-  return kind === "stablecoin" ? "stablecoin" as const
-    : kind === "orderbook-gap" ? "gapTrading" as const
+  return kind === "orderbook-gap"
+    ? "gapTrading" as const
+    : kind === "ai-autonomous"
+      ? "aiAgent" as const
       : "imbalance" as const;
 }
 
 function signalIdSchema(kind: SpotPositionRouteKind) {
-  if (kind === "stablecoin") return z.string().trim().min(1).max(100).regex(/^stablecoin:[A-Z0-9_-]+$/i);
   if (kind === "orderbook-gap") return z.string().trim().min(1).max(120).regex(/^gap:[A-Z0-9_-]+IRT:ask:\d+$/i);
+  if (kind === "ai-autonomous") return z.string().trim().min(1).max(100).regex(/^ai-market:[A-Z0-9_-]+IRT$/i);
   return z.string().trim().min(1).max(100).regex(/^imbalance:[A-Z0-9_-]+IRT$/i);
 }
 
 async function recordPnlOrStop(
   dependencies: Pick<SpotPositionRouteDependencies, "recordPnl" | "emergencyStop">,
-  strategy: "stablecoin" | "gapTrading" | "imbalance",
+  strategy: "gapTrading" | "imbalance" | "aiAgent",
+  executionId: number,
   pnlToman: number
 ) {
   try {
-    await dependencies.recordPnl(pnlToman);
+    await dependencies.recordPnl(pnlToman, new Date(), {
+      idempotencyKey: `spot:${executionId}:pnl`
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : "unknown-risk-accounting-error";
     await dependencies.emergencyStop(`${strategy}-risk-accounting-failed:${message}`).catch(() => undefined);
     throw error;
   }
+}
+
+function withSpotCapital(
+  settings: BotSettings,
+  kind: SpotPositionRouteKind,
+  capitalToman: number
+): BotSettings {
+  if (kind === "orderbook-gap") {
+    return {
+      ...settings,
+      strategyLab: {
+        ...settings.strategyLab,
+        gapTrading: { ...settings.strategyLab.gapTrading, capitalToman }
+      }
+    };
+  }
+  if (kind === "ai-autonomous") {
+    return {
+      ...settings,
+      aiAgent: { ...settings.aiAgent, maxLiveCapitalToman: capitalToman }
+    };
+  }
+  return {
+    ...settings,
+    strategyLab: {
+      ...settings.strategyLab,
+      imbalance: { ...settings.strategyLab.imbalance, capitalToman }
+    }
+  };
+}
+
+function candidateId(candidate: SpotPositionRouteCandidate) {
+  return candidate.id;
+}
+
+function candidateSymbols(candidate: SpotPositionRouteCandidate) {
+  return candidate.kind === "autonomous-market" ? [candidate.symbol] : candidate.symbols;
+}
+
+function candidateEstimatedProfit(candidate: SpotPositionRouteCandidate) {
+  return candidate.kind === "autonomous-market"
+    ? new Decimal(candidate.estimatedNetProfitToman)
+    : candidate.estimatedNetProfitToman;
 }
 
 function isTerminalOrder(status: string) {

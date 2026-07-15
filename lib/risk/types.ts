@@ -1,10 +1,8 @@
 export const RISK_STRATEGIES = [
   "triangle",
-  "crossQuote",
-  "pairs",
-  "stablecoin",
   "gapTrading",
-  "imbalance"
+  "imbalance",
+  "aiAgent"
 ] as const;
 
 export type RiskStrategy = (typeof RISK_STRATEGIES)[number];

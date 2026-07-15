@@ -6,6 +6,14 @@ import { NobitexClient } from "@/lib/exchanges/nobitex";
 import { scanConfiguredStrategies } from "@/lib/strategies/service";
 import type { StrategyKind, StrategySignal } from "@/lib/strategies/types";
 import type { RiskStrategy } from "@/lib/risk/types";
+import type { AiAgentSettings } from "@/lib/ai-agent/settings";
+import {
+  recordAiLiveDecision,
+  selectAiLiveCandidate,
+  type AiLiveSelection
+} from "@/lib/ai-agent/live-policy";
+import { scanAiMarketBooks } from "@/lib/ai-agent/scanner-service";
+import type { IndependentAiMarketCandidate } from "@/lib/ai-agent/market-scanner";
 import {
   assertLiveOwnerForOrder,
   getLiveOwnerStatus,
@@ -70,13 +78,26 @@ export type LiveSchedulerRuntime = {
 export type LiveSchedulerDependencies = {
   isProduction(): boolean;
   now(): number;
-  getSettings(): Promise<{ scanIntervalMs: number }>;
+  getSettings(): Promise<{ scanIntervalMs: number; aiAgent?: AiAgentSettings }>;
   getRiskSnapshot(): ReturnType<typeof getRiskControlSnapshot>;
   getOwnerStatus(): Promise<PublicLiveOwnerStatus>;
   assertOwner(): Promise<unknown>;
   executeTriangle(request: Request): Promise<Response>;
+  discoverAiCandidates?(): Promise<IndependentAiMarketCandidate[]>;
+  executeAiCandidate?(candidateId: string): Promise<Response>;
   discoverStrategySignals?(): Promise<StrategySignal[]>;
   executeStrategy?(kind: StrategyKind, signalId: string): Promise<Response>;
+  selectAiCandidate?(input: {
+    candidates: IndependentAiMarketCandidate[];
+    settings: AiAgentSettings;
+  }): Promise<{ selection?: AiLiveSelection; blockers: string[] }>;
+  recordAiDecision?(input: {
+    settings: AiAgentSettings;
+    action: string;
+    candidate?: IndependentAiMarketCandidate;
+    probability?: number;
+    detail?: string;
+  }): Promise<void>;
 };
 
 type SchedulerGlobal = typeof globalThis & {
@@ -100,6 +121,19 @@ const defaultDependencies: LiveSchedulerDependencies = {
     const { POST } = await import("@/app/api/live/execute/route");
     return POST(request);
   },
+  discoverAiCandidates: async () => {
+    const settings = await getBotSettings();
+    const client = new NobitexClient();
+    const books = await client.getAllOrderBooks();
+    return scanAiMarketBooks(books, settings, {
+      capitalToman: settings.aiAgent.maxLiveCapitalToman
+    }).candidates;
+  },
+  executeAiCandidate: async candidateId => {
+    const request = internalAiRequest(candidateId);
+    const { POST } = await import("@/app/api/ai-agent/execute/route");
+    return POST(request);
+  },
   discoverStrategySignals: async () => {
     const settings = await getBotSettings();
     const client = new NobitexClient();
@@ -108,13 +142,11 @@ const defaultDependencies: LiveSchedulerDependencies = {
   },
   executeStrategy: async (kind, signalId) => {
     const request = internalStrategyRequest(kind, signalId);
-    if (kind === "cross-quote") {
-      const { POST } = await import("@/app/api/strategies/cross-quote/execute/route");
-      return POST(request);
-    }
     const { POST } = await import("@/app/api/strategies/auto-execute/route");
     return POST(request);
-  }
+  },
+  selectAiCandidate: selectAiLiveCandidate,
+  recordAiDecision: recordAiLiveDecision
 };
 
 export function createLiveSchedulerRuntime(now = Date.now()): LiveSchedulerRuntime {
@@ -233,14 +265,68 @@ export async function runLiveSchedulerTick(
       }
     }
 
-    const nonTriangle = new Set(runnable.filter(strategy => strategy !== "triangle"));
-    if (!nonTriangle.size || !dependencies.discoverStrategySignals || !dependencies.executeStrategy) {
-      return pushEvent(runtime, { at: now, outcome: "no-opportunity", strategy: triangleRunnable ? "triangle" : undefined });
+    const aiRunnable = runnable.includes("aiAgent");
+    const aiSettings = settings.aiAgent;
+    let aiNoOpportunityCode: string | undefined;
+    if (aiRunnable && aiSettings?.enabled && aiSettings.mode === "live") {
+      if (!dependencies.discoverAiCandidates || !dependencies.executeAiCandidate || !dependencies.selectAiCandidate) {
+        return pushEvent(runtime, {
+          at: now,
+          outcome: "risk-blocked",
+          code: "ai-policy-unavailable"
+        });
+      }
+      const independentCandidates = await dependencies.discoverAiCandidates();
+      const ranked = await dependencies.selectAiCandidate({
+        candidates: independentCandidates,
+        settings: aiSettings
+      });
+      const aiSelection = ranked.selection;
+      if (aiSelection) {
+        const response = await dependencies.executeAiCandidate(aiSelection.candidate.id);
+        const payload = await safePayload(response);
+        const outcome = response.ok ? responseOutcome(payload.status) : "rejected";
+        await dependencies.recordAiDecision?.({
+          settings: aiSettings,
+          action: outcome,
+          candidate: aiSelection.candidate,
+          probability: aiSelection.probability,
+          detail: safeDetail(payload.reason ?? payload.error)
+        });
+        if (outcome !== "no-opportunity") {
+          return pushEvent(runtime, {
+            at: now,
+            outcome,
+            strategy: "aiAgent",
+            httpStatus: response.status,
+            code: safeCode(payload.code),
+            detail: safeDetail(payload.reason ?? payload.error)
+          });
+        }
+      } else {
+        aiNoOpportunityCode = ranked.blockers[0] ?? "no-qualified-live-candidate";
+      }
+    } else if (aiRunnable) {
+      aiNoOpportunityCode = !aiSettings?.enabled ? "ai-agent-disabled" : "ai-agent-demo-mode";
     }
-    const candidates = (await dependencies.discoverStrategySignals())
-      .filter(signal => signal.status === "actionable" && nonTriangle.has(signalRiskStrategy(signal.kind)))
-      .sort((left, right) => right.estimatedNetProfitToman.comparedTo(left.estimatedNetProfitToman));
-    const candidate = candidates[0];
+
+    // Gap and Imbalance remain independent engines. Enabling AI Demo must not
+    // suppress their own explicitly enabled Live workflows.
+    const strategyEngines = new Set<RiskStrategy>(runnable.filter(strategy =>
+      strategy === "gapTrading" || strategy === "imbalance"
+    ));
+    if (!strategyEngines.size || !dependencies.discoverStrategySignals || !dependencies.executeStrategy) {
+      return pushEvent(runtime, {
+        at: now,
+        outcome: "no-opportunity",
+        strategy: aiRunnable ? "aiAgent" : triangleRunnable ? "triangle" : undefined,
+        code: aiNoOpportunityCode
+      });
+    }
+    const discovered = await dependencies.discoverStrategySignals();
+    const candidate = discovered
+      .filter(signal => signal.status === "actionable" && strategyEngines.has(signalRiskStrategy(signal.kind)))
+      .sort((left, right) => right.estimatedNetProfitToman.comparedTo(left.estimatedNetProfitToman))[0];
     if (!candidate) return pushEvent(runtime, { at: now, outcome: "no-opportunity" });
 
     const strategy = signalRiskStrategy(candidate.kind);
@@ -343,14 +429,24 @@ function internalStrategyRequest(kind: StrategyKind, signalId: string) {
       origin: "http://nobitex-internal",
       "x-strategy-action": "nobitex-dashboard"
     },
-    body: JSON.stringify(kind === "cross-quote" ? { signalId } : { kind, signalId })
+    body: JSON.stringify({ kind, signalId })
+  });
+}
+
+function internalAiRequest(candidateId: string) {
+  return new Request("http://nobitex-internal/api/ai-agent/execute", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      host: "nobitex-internal",
+      origin: "http://nobitex-internal",
+      "x-strategy-action": "nobitex-dashboard"
+    },
+    body: JSON.stringify({ signalId: candidateId })
   });
 }
 
 function signalRiskStrategy(kind: StrategyKind): Exclude<RiskStrategy, "triangle"> {
-  if (kind === "cross-quote") return "crossQuote";
-  if (kind === "statistical-pairs") return "pairs";
-  if (kind === "stablecoin") return "stablecoin";
   if (kind === "orderbook-gap") return "gapTrading";
   return "imbalance";
 }

@@ -1,7 +1,7 @@
 import Decimal from "decimal.js";
 import { bookSpreadBps, quoteEdge } from "@/lib/bot/engine";
 import type { Level, OrderBook } from "@/lib/exchanges/types";
-import { measureOrderbookImbalance } from "./orderbook-imbalance";
+import { measureOrderbookImbalance, summarizeSnapshotOrderFlow } from "./orderbook-imbalance";
 import type { OrderbookObservation } from "./orderbook-history";
 import type { StrategyLabConfig, StrategyLabContext, StrategySignal } from "./types";
 
@@ -129,6 +129,20 @@ export function scanOrderbookGaps(
       const spreadSafe = spread.lte(settings.maxSpreadBps);
       const source = context.orderbookHistory?.get(book.symbol) ?? [{ observedAt: now, book }];
       const persistence = measurePersistence(source, book, candidate, settings, now);
+      const flowSource = source
+        .filter(item => item.observedAt <= now && now - item.observedAt <= settings.sampleWindowMs)
+        .slice(-(Math.max(settings.minFlowSamples, settings.minConfirmations, 3) + 1));
+      if (!flowSource.some(item => item.observedAt === now)) flowSource.push({ observedAt: now, book });
+      const orderFlow = summarizeSnapshotOrderFlow(
+        flowSource,
+        settings.levels,
+        settings.levelWeightDecayPercent,
+        1,
+        Math.max(settings.minFlowSamples, settings.minConfirmations, 3)
+      );
+      const flowSamplesSafe = orderFlow.sampleCount >= settings.minFlowSamples;
+      const orderFlowSafe = orderFlow.normalizedFlow.gte(settings.minOrderFlowImbalance);
+      const liquidityRetentionSafe = orderFlow.bidLiquidityRetentionPercent.gte(settings.minBidLiquidityRetentionPercent);
 
       let imbalance: ReturnType<typeof measureOrderbookImbalance> | undefined;
       try {
@@ -200,6 +214,9 @@ export function scanOrderbookGaps(
         spreadSafe,
         gapAnomalySafe: true,
         persistenceSafe: persistence.safe,
+        flowSamplesSafe,
+        orderFlowSafe,
+        liquidityRetentionSafe,
         visibleDepthSafe,
         bidSupportSafe,
         micropriceSafe,
@@ -219,6 +236,12 @@ export function scanOrderbookGaps(
         fresh,
         spreadSafe,
         persistenceSafe: persistence.safe,
+        flowSamplesSafe,
+        orderFlowSafe,
+        liquidityRetentionSafe,
+        orderFlowSampleCount: orderFlow.sampleCount,
+        normalizedOrderFlow: orderFlow.normalizedFlow,
+        bidLiquidityRetentionPercent: orderFlow.bidLiquidityRetentionPercent,
         visibleDepthSafe,
         bidSupportSafe,
         micropriceSafe,
@@ -234,6 +257,8 @@ export function scanOrderbookGaps(
         settings,
         persistence,
         bidSupportRatio: imbalance?.ratio,
+        orderFlowSafe,
+        liquidityRetentionSafe,
         analyticalSetupPassed
       });
 
@@ -270,6 +295,12 @@ export function scanOrderbookGaps(
           confirmations: persistence.confirmations,
           persistenceMs: persistence.persistenceMs,
           temporalConfirmed: persistence.safe,
+          orderFlowSampleCount: orderFlow.sampleCount,
+          normalizedOrderFlow: orderFlow.normalizedFlow.toNumber(),
+          bidLiquidityRetentionPercent: orderFlow.bidLiquidityRetentionPercent.toNumber(),
+          askLiquidityRetentionPercent: orderFlow.askLiquidityRetentionPercent.toNumber(),
+          orderFlowConfirmed: flowSamplesSafe && orderFlowSafe,
+          liquidityRetentionPassed: liquidityRetentionSafe,
           spreadBps: spread.toNumber(),
           bidSupportRatio: imbalance?.ratio.toNumber() ?? 0,
           micropriceBiasBps: imbalance?.micropriceBiasBps.toNumber() ?? 0,
@@ -300,7 +331,7 @@ export function scanOrderbookGaps(
           spotExecutable: liveSetupPassed,
           otcExecutable: false,
           snapshotOnly: false,
-          liveBlocker: liveSetupPassed ? "" : "forward-outcome-calibration-incomplete"
+          liveBlocker: liveSetupPassed ? "" : failedGates.join(",")
         },
         scannedAt: now
       });
@@ -342,6 +373,25 @@ function measureForwardGapOutcomes(
       || gap.gapBps.lt(settings.minGapBps)
       || gap.robustZScore.lt(settings.minGapZScore)
       || ratio.lt(settings.minGapRatio)) continue;
+    const sourceFlow = summarizeSnapshotOrderFlow(
+      ordered.slice(Math.max(0, index - Math.max(settings.minFlowSamples, 3)), index + 1),
+      settings.levels,
+      settings.levelWeightDecayPercent,
+      1,
+      Math.max(settings.minFlowSamples, 3)
+    );
+    if (sourceFlow.sampleCount < settings.minFlowSamples
+      || sourceFlow.normalizedFlow.lt(settings.minOrderFlowImbalance)
+      || sourceFlow.bidLiquidityRetentionPercent.lt(settings.minBidLiquidityRetentionPercent)) continue;
+    try {
+      const support = measureOrderbookImbalance(source.book, settings.levels, settings.levelWeightDecayPercent, 1);
+      if (!support.bidHeavy
+        || support.ratio.lt(settings.minBidSupportRatio)
+        || support.micropriceBiasBps.lt(settings.minMicropriceBiasBps)
+        || support.dominantTopLevelSharePercent.gt(settings.maxTopLevelSharePercent)) continue;
+    } catch {
+      continue;
+    }
     const target = ordered.slice(index + 1)
       .find(item => item.observedAt - source.observedAt >= settings.predictionHorizonMs);
     if (!target) continue;
@@ -481,6 +531,12 @@ function gapReasons(input: {
   fresh: boolean;
   spreadSafe: boolean;
   persistenceSafe: boolean;
+  flowSamplesSafe: boolean;
+  orderFlowSafe: boolean;
+  liquidityRetentionSafe: boolean;
+  orderFlowSampleCount: number;
+  normalizedOrderFlow: Decimal;
+  bidLiquidityRetentionPercent: Decimal;
   visibleDepthSafe: boolean;
   bidSupportSafe: boolean;
   micropriceSafe: boolean;
@@ -499,6 +555,9 @@ function gapReasons(input: {
   if (!input.fresh) return ["The orderbook snapshot is stale."];
   if (!input.spreadSafe) return ["Current spread is above the configured maximum."];
   if (!input.persistenceSafe) return [`Gap persistence is incomplete: ${input.confirmations} snapshots over ${input.persistenceMs} ms.`];
+  if (!input.flowSamplesSafe) return [`Order-flow history is incomplete: ${input.orderFlowSampleCount} snapshot transitions.`];
+  if (!input.orderFlowSafe) return [`Snapshot MLOFI ${input.normalizedOrderFlow.toFixed(4)} does not confirm bullish pressure into the ask gap.`];
+  if (!input.liquidityRetentionSafe) return [`Bid liquidity retention ${input.bidLiquidityRetentionPercent.toFixed(1)}% is too low; support may be fleeting.`];
   if (!input.visibleDepthSafe || !input.bidSupportSafe || !input.micropriceSafe || !input.concentrationSafe) {
     return ["Visible depth, bid support, microprice or wall-concentration safety did not pass."];
   }
@@ -514,6 +573,8 @@ function gapConfidence(input: {
   settings: GapSettings;
   persistence: { confirmations: number; safe: boolean };
   bidSupportRatio?: Decimal;
+  orderFlowSafe: boolean;
+  liquidityRetentionSafe: boolean;
   analyticalSetupPassed: boolean;
 }) {
   const anomaly = Decimal.min(25, input.candidate.robustZScore.div(input.settings.minGapZScore).mul(18));
@@ -522,7 +583,10 @@ function gapConfidence(input: {
   const support = input.bidSupportRatio
     ? Decimal.min(15, input.bidSupportRatio.div(input.settings.minBidSupportRatio).mul(10))
     : new Decimal(0);
-  return Decimal.min(85, anomaly.plus(magnitude).plus(persistence).plus(support).plus(input.analyticalSetupPassed ? 5 : 0));
+  return Decimal.min(90, anomaly.plus(magnitude).plus(persistence).plus(support)
+    .plus(input.orderFlowSafe ? 7 : 0)
+    .plus(input.liquidityRetentionSafe ? 5 : 0)
+    .plus(input.analyticalSetupPassed ? 5 : 0));
 }
 
 function normalizedLevels(book: OrderBook, side: GapSide, levels: number): Level[] {

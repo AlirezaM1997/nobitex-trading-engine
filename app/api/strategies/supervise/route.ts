@@ -7,9 +7,6 @@ import {
   isDashboardStrategyRequest,
   type SpotPositionRouteKind
 } from "@/lib/strategies/spot-position-route";
-import { POST as supervisePairs } from "@/app/api/strategies/statistical-pairs/execute/route";
-import { emergencyStopRiskControl } from "@/lib/risk/store";
-import { acquireStrategyExecutionRecordLock, releaseStrategyExecutionRecordLock } from "@/lib/strategy-execution-lock";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -17,11 +14,7 @@ export const runtime = "nodejs";
 type SupervisorDependencies = {
   isMainnet(): boolean;
   listExecutions: typeof listStrategyExecutions;
-  monitorPairs(request: Request): Promise<Response>;
   recoverSpot(request: Request, kind: SpotPositionRouteKind): Promise<Response>;
-  acquireRecordLock?: typeof acquireStrategyExecutionRecordLock;
-  releaseRecordLock?: typeof releaseStrategyExecutionRecordLock;
-  emergencyStop?: typeof emergencyStopRiskControl;
 };
 
 type SupervisorRuntime = {
@@ -38,11 +31,7 @@ const defaultDependencies: SupervisorDependencies = {
     catch { return false; }
   },
   listExecutions: listStrategyExecutions,
-  monitorPairs: supervisePairs,
-  recoverSpot: (request, kind) => handleSpotPositionRecoveryRequest(request, kind),
-  acquireRecordLock: acquireStrategyExecutionRecordLock,
-  releaseRecordLock: releaseStrategyExecutionRecordLock,
-  emergencyStop: emergencyStopRiskControl
+  recoverSpot: (request, kind) => handleSpotPositionRecoveryRequest(request, kind)
 };
 
 export async function POST(request: Request) {
@@ -115,35 +104,10 @@ export async function handleStrategySupervisor(request: Request, dependencies: S
     return new Request(request.url, { method: "POST", headers, body: JSON.stringify(body) });
   };
 
-  // Pairs owns its lifecycle decisions server-side (fresh OHLC/Z-score, beta
-  // drift, stop and max-holding). This tick also reconciles interrupted entries.
-  const pairsResponse = await dependencies.monitorPairs(delegated({ action: "monitor" }));
-  const pairs = await responsePayload(pairsResponse);
-
   const history = await dependencies.listExecutions({ limit: 200 });
   const activeStates = new Set(["SUBMITTING", "PARTIALLY_FILLED", "HEDGING", "RECOVERING"]);
-  const crossQuoteReviews: Array<Record<string, unknown>> = [];
-  if (dependencies.acquireRecordLock && dependencies.releaseRecordLock && dependencies.emergencyStop) {
-    for (const record of history.records.filter(item => item.strategy === "crossQuote" && activeStates.has(item.state)).slice(0, 10)) {
-      const acquired = await dependencies.acquireRecordLock({
-        executionId: record.id,
-        owner: `cross-quote:restart-audit:${record.id}`,
-        ttlMs: 60_000
-      });
-      if (!acquired.acquired) {
-        crossQuoteReviews.push({ executionId: record.id, status: "owned-by-live-worker" });
-        continue;
-      }
-      try {
-        await dependencies.emergencyStop(`cross-quote-restart-review-required:${record.id}`);
-        crossQuoteReviews.push({ executionId: record.id, status: "manual-review", emergencyStop: true });
-      } finally {
-        await dependencies.releaseRecordLock(acquired.lock).catch(() => undefined);
-      }
-    }
-  }
   const activeSpot = history.records
-    .filter(record => (record.strategy === "stablecoin" || record.strategy === "gapTrading" || record.strategy === "imbalance")
+    .filter(record => (record.strategy === "gapTrading" || record.strategy === "imbalance" || record.strategy === "aiAgent")
       && Boolean(record.signalId)
       && activeStates.has(record.state))
     .sort((a, b) => a.updatedAt - b.updatedAt);
@@ -151,16 +115,16 @@ export async function handleStrategySupervisor(request: Request, dependencies: S
   // the authoritative fence: a healthy worker returns POSITION_ALREADY_OWNED,
   // while a restarted process can safely take over its dead generation.
   if (!activeSpot.length) {
-    return NextResponse.json({ status: "checked", pairs, crossQuoteReviews, spotRecoveries: [], activeSpotCount: 0 });
+    return NextResponse.json({ status: "checked", spotRecoveries: [], activeSpotCount: 0 });
   }
 
   const spotRecoveries: Array<Record<string, unknown>> = [];
   for (const record of activeSpot.slice(0, 10)) {
     if (!record.signalId) continue;
-    const kind: SpotPositionRouteKind = record.strategy === "stablecoin"
-      ? "stablecoin"
-      : record.strategy === "gapTrading"
+    const kind: SpotPositionRouteKind = record.strategy === "gapTrading"
         ? "orderbook-gap"
+      : record.strategy === "aiAgent"
+        ? "ai-autonomous"
         : "orderbook-imbalance";
     const response = await dependencies.recoverSpot(delegated({ signalId: record.signalId }), kind);
     spotRecoveries.push({ executionId: record.id, kind, ...await responsePayload(response) });
@@ -169,8 +133,6 @@ export async function handleStrategySupervisor(request: Request, dependencies: S
   const failed = spotRecoveries.some(item => Number(item.httpStatus) >= 500);
   return NextResponse.json({
     status: recovered ? "recovery-checked" : "recovery-deferred",
-    pairs,
-    crossQuoteReviews,
     spotRecoveries,
     activeSpotCount: activeSpot.length
   }, { status: failed ? 502 : 200 });

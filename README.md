@@ -12,13 +12,10 @@
 | موتور | دامنه اجرای سفارش | خودکار | پایان با PnL تومانی بسته | وضعیت فعلی |
 |---|---|---:|---:|---|
 | Triangular Arbitrage | فقط API رسمی نوبیتکس و Production | بله | بله/با Dust مشخص | چرخه سه‌سفارشی IRT با بازاعتبارسنجی و Recovery |
-| Statistical Pairs | فقط API رسمی نوبیتکس و Production | بله | بله | Spot Long و Margin Short با ثبت پوزیشن، خروج و Recovery |
-| Stablecoin Convergence | فقط API رسمی نوبیتکس و Production | بله | بله | اجرای Long-only اسپات پس از کنترل عمق، هزینه و همگرایی |
 | Orderbook Imbalance | فقط API رسمی نوبیتکس و Production | بله | بله | اجرای Long-only اسپات فقط پس از کالیبراسیون Forward Outcome |
-| Cross-Quote Arbitrage | فقط API رسمی نوبیتکس و Production | بله | بله | چرخه بسته سه‌سفارشی IRT→Asset/USDT→IRT با لجر موجودی و Recovery |
 | Orderbook Gap / Liquidity Vacuum | Spot رسمی نوبیتکس و Production | بله | بله | اجرای Long-only اسپات فقط پس از کالیبراسیون Forward Outcome؛ OTC همچنان پشتیبانی نمی‌شود |
 
-هر شش موتور مسیر اجرای واقعی سمت سرور دارند. روشن‌کردن موتور به‌تنهایی سفارش ایجاد نمی‌کند؛ سیگنال باید همه فیلترهای اختصاصی، کالیبراسیون، نقدشوندگی و کنترل ریسک را پاس کند. محدودیت دامنه، Production، سرمایه و ریسک در سمت سرور اعمال می‌شود و از رابط کاربری قابل دورزدن نیست.
+هر سه موتور مسیر اجرای واقعی سمت سرور دارند. روشن‌کردن موتور به‌تنهایی سفارش ایجاد نمی‌کند؛ سیگنال باید همه فیلترهای اختصاصی، کالیبراسیون، نقدشوندگی و کنترل ریسک را پاس کند. محدودیت دامنه، Production، سرمایه و ریسک در سمت سرور اعمال می‌شود و از رابط کاربری قابل دورزدن نیست.
 
 ## مرکز واحد کنترل اجرای واقعی
 
@@ -63,22 +60,6 @@
 - پیش از هر درخواست ثبت سفارش، `clientOrderId` و رویداد `SUBMITTING` در لجر immutable نوشته می‌شود؛ شکست این ثبت مانع ارسال سفارش است.
 - در Startup، اجرای نیمه‌تمام هرگز خودکار تکرار نمی‌شود؛ شواهد سفارش باعث Emergency Stop و `MANUAL_REVIEW` می‌شوند.
 
-### Statistical Pairs
-
-- رابطه تاریخی دو دارایی با OHLC، OLS Beta و Z-Score بررسی می‌شود.
-- مدل سیگنال شامل Spot Long و Margin Short با Hedge Ratio است و فقط پس از تأیید مدل و کنترل ریسک وارد اجرای واقعی می‌شود.
-- Beta مثبت، حداقل Correlation، ADF/نیمه‌عمر Residual، Holdout Drift و هزینه رفت‌وبرگشت باید هم‌زمان پاس شوند.
-- اسپرد/اثر قیمت ورود، تحمل خطای Hedge، Beta Drift، Margin Ratio، فاصله تا Liquidation، Stop Z-Score و Max Holding قابل تنظیم‌اند.
-- Supervisor خروج آماری و وضعیت Margin را مانیتور می‌کند و در Fill نامتقارن یا Restart، Position State ذخیره‌شده را تطبیق می‌دهد.
-
-### Stablecoin Convergence
-
-- انحراف USDC/DAI و دارایی‌های تنظیم‌شده از مرجع بررسی می‌شود.
-- فقط مسیر Spot Long از IRT پشتیبانی می‌شود؛ سیگنال Short ساختگی اجرا نمی‌شود.
-- سیگنال با عمق واقعی ورود و خروج، Spread، Price Impact، کارمزد، لغزش و خروج فرضی در Parity سنجیده می‌شود.
-- خروج موفق به IRT برمی‌گردد و PnL بسته تومانی ثبت می‌شود.
-- تا عبور انحراف، زمان همگرایی، نقدشوندگی و بازده خالص از آستانه‌های تنظیم‌شده، ورود واقعی انجام نمی‌شود.
-
 ### Orderbook Imbalance
 
 - نسبت حجم Bid/Ask در چند سطح اردربوک، عمق قابل اتکا و اسپرد سنجیده می‌شود.
@@ -87,10 +68,6 @@
 - پیش‌بینی فقط پس از حداقل نمونه نتیجه، Hit Rate و بازده محافظه‌کارانه خالص معتبر می‌شود؛ تا آن زمان سیگنال روی حالت پایش می‌ماند و سفارش ارسال نمی‌شود.
 - خروج و Recovery فقط باقی‌مانده‌ی تأییدشده‌ی همان اجرا را به IRT می‌فروشند تا Double Sell رخ ندهد.
 
-### Cross-Quote Arbitrage
-
-این مدل اختلاف قیمت یک دارایی در بازار IRT و USDT را می‌سنجد و جهت برنده را به چرخه بسته سه‌سفارشی تبدیل می‌کند. سرمایه با IRT شروع می‌شود، ضلع USDT/IRT تسویه نهایی را انجام می‌دهد و فقط نتیجه‌ای که بسته‌شدن موجودی غیرتومانی آن اثبات شده باشد به‌عنوان PnL قطعی ثبت می‌شود. وضعیت مبهم سفارش یا باقی‌مانده تأییدنشده، اجرای جدید را Fail-Closed و نیازمند بررسی می‌کند.
-
 ### Orderbook Gap / Liquidity Vacuum
 
 - این موتور جایگزین Market Making شده و فاصله‌های غیرعادی میان Levelهای نزدیک قیمت، Median/MAD، ماندگاری چند Snapshot، Bid Support، Microprice، تمرکز نقدینگی، Spread، Price Impact و هزینه رفت‌وبرگشت را بررسی می‌کند.
@@ -98,6 +75,18 @@
 - ورود واقعی فقط برای Ask Gap صعودی اسپات و پس از حداقل نمونه Forward Outcome، Hit Rate، بازده محافظه‌کارانه، ماندگاری Gap، عمق، اثر قیمت و هزینه رفت‌وبرگشت مجاز است. خروج با مصرف‌شدن Gap، Take Profit، Stop Loss یا Max Hold انجام می‌شود و Recovery باقی‌مانده را به IRT برمی‌گرداند.
 - OTC نوبیتکس اردربوک عمومی ندارد و API رسمی فعلی قرارداد قابل اتکایی برای firm quote و execution ارائه نمی‌کند، بنابراین OTC نیز fail-closed است.
 - طراحی و فرمول‌ها در [docs/orderbook-gap-strategy.md](docs/orderbook-gap-strategy.md) ثبت شده‌اند.
+
+### Autonomous Spot Agent (Demo / Live)
+
+- تب «دستیار هوشمند» دو حالت دارد: Demo یک کیف پول و پوزیشن کاملاً مجازی می‌سازد؛ Live پس از یک‌بار فعال‌شدن، برای هر معامله تأیید جداگانه نمی‌خواهد.
+- Demo با Bid/Ask قابل اجرا و عمق چندسطحی محاسبه می‌شود؛ کارمزد، لغزش، Spread و Price Impact در ورود و خروج لحاظ می‌شوند و Midpoint به‌عنوان Fill استفاده نمی‌شود.
+- مدل یک Logistic Model عددی، محدود و قابل ممیزی است. ویژگی‌های آن از Edge، Confidence، MLOFI، Microprice، Liquidity Retention، Spread، Impact، هزینه رفت‌وبرگشت و Persistence ساخته می‌شوند.
+- پیش‌بینی پیش از نتیجه ذخیره و مدل فقط پس از بسته‌شدن پوزیشن مجازی به‌روزرسانی می‌شود. این «خودبه‌روزرسانی» به معنی تغییر خودکار کد، Risk Limits یا کلید Master نیست.
+- اسکنر AI مستقیماً همه بازارهای Spot تومانی نوبیتکس را از اردربوک خام بررسی می‌کند و هیچ Signal ورودی از موتورهای Orderbook Gap یا Imbalance نمی‌گیرد. این سه موتور مستقل روشن/خاموش می‌شوند.
+- هنگام Live وزن‌های مدل آنلاین Freeze می‌شوند تا مدل وسط یک اجرای واقعی تغییر نکند؛ یادگیری محلی با بازگشت صریح به Demo ادامه پیدا می‌کند.
+- AI فقط Candidate ID سروری `ai-market:SYMBOL` را به اجرای امن می‌دهد. مبلغ، جهت، قیمت و شرایط سفارش دوباره از تنظیمات، موجودی و اردربوک تازه ساخته می‌شوند؛ Master، Emergency Stop، Live Owner، Lease، Recovery و دو مرحله Revalidation قابل دورزدن نیستند.
+- دیتاست خارجی فقط یک Artifact با نقش Candidate/Shadow می‌سازد. نمونه‌های خارجی شمارنده آمادگی Live را افزایش نمی‌دهند، مدل جاری را فعال یا جایگزین نمی‌کنند و هیچ Promotion خودکاری وجود ندارد.
+- آربیتراژ مثلثی، Orderbook Gap، Orderbook Imbalance و Autonomous AI مستقل باقی می‌مانند.
 
 ## اسکن، اجرای خودکار و Supervisor
 
@@ -163,6 +152,8 @@ bun run start
 |---|---|
 | `data/bot-settings.json` | تنظیمات عمومی و اختصاصی موتورهای داشبورد |
 | `data/risk-state.json` | Master، Emergency Stop، مجوز موتورها، PnL روزانه و Hard Limits |
+| `data/ai-agent-state.json` | پرتفوی و معاملات Demo، وزن‌های مدل آنلاین و تصمیم‌های ممیزی‌شده AI؛ جدا از لاگ معاملات واقعی و خارج از Git |
+| `data/ai-models/*.json` | Artifactهای تغییرناپذیر Candidate/Shadow همراه Provenance، Checksum و معیارهای Train/Validation/Test؛ خارج از Git و بدون مسیر فعال‌سازی خودکار |
 | `data/arbitrage.sqlite` | تاریخچه فرصت‌های Triangle و لاگ اجرای واقعی Triangle |
 | `data/strategy-executions.sqlite` | State Machine، Transition Audit، Plan، Order ID، Fill، Fee و نتیجه موتورهای Strategy Lab |
 | `data/execution-ledger.sqlite` | لجر immutable و hash-chained رویدادهای سفارش Live Triangle؛ هنگام نخستین اجرای واقعی ساخته می‌شود |

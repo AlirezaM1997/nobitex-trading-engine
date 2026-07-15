@@ -27,30 +27,6 @@ export const STRATEGY_RUNTIME_CAPABILITIES: Readonly<Record<RiskStrategy, Strate
     recoveryEndpoint: null,
     blocker: null
   },
-  crossQuote: {
-    scope: "mainnet-only",
-    automaticExecution: true,
-    closedTomanPnl: true,
-    executionEndpoint: "/api/strategies/cross-quote/execute",
-    recoveryEndpoint: null,
-    blocker: null
-  },
-  pairs: {
-    scope: "mainnet-only",
-    automaticExecution: true,
-    closedTomanPnl: true,
-    executionEndpoint: "/api/strategies/statistical-pairs/execute",
-    recoveryEndpoint: "/api/strategies/statistical-pairs/execute",
-    blocker: null
-  },
-  stablecoin: {
-    scope: "mainnet-only",
-    automaticExecution: true,
-    closedTomanPnl: true,
-    executionEndpoint: "/api/strategies/stablecoin/execute",
-    recoveryEndpoint: "/api/strategies/stablecoin/recover",
-    blocker: null
-  },
   gapTrading: {
     scope: "mainnet-only",
     automaticExecution: true,
@@ -65,6 +41,14 @@ export const STRATEGY_RUNTIME_CAPABILITIES: Readonly<Record<RiskStrategy, Strate
     closedTomanPnl: true,
     executionEndpoint: "/api/strategies/orderbook-imbalance/execute",
     recoveryEndpoint: "/api/strategies/orderbook-imbalance/recover",
+    blocker: null
+  },
+  aiAgent: {
+    scope: "mainnet-only",
+    automaticExecution: true,
+    closedTomanPnl: true,
+    executionEndpoint: "/api/ai-agent/execute",
+    recoveryEndpoint: "/api/ai-agent/recover",
     blocker: null
   }
 });

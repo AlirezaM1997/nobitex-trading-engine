@@ -147,3 +147,11 @@ test("dashboard cleanup removes safe Triangle history and preserves ambiguous ex
   expect(unfinished.some(record => record.id === activeId && record.status === "PREPARING" && !record.ordersCorrupt)).toBe(true);
   expect(unfinished.some(record => record.id === ambiguousId)).toBe(false);
 });
+
+test("administrative purge physically removes opportunity and Triangle execution rows", async () => {
+  const { getLiveExecutionHistory, getOpportunityHistory, purgeAllOpportunityDatabaseData } = await import("@/lib/opportunity-store");
+  const deleted = await purgeAllOpportunityDatabaseData();
+  expect(deleted.total).toBeGreaterThan(0);
+  expect((await getOpportunityHistory()).summary.recordCount).toBe(0);
+  expect((await getLiveExecutionHistory()).summary.attemptCount).toBe(0);
+});

@@ -5,6 +5,7 @@ import {
   runLiveSchedulerTick,
   type LiveSchedulerDependencies
 } from "@/lib/runtime/live-scheduler";
+import { defaultAiAgentSettings } from "@/lib/ai-agent/settings";
 
 function dependencies(overrides: Partial<LiveSchedulerDependencies> = {}): LiveSchedulerDependencies {
   return {
@@ -119,15 +120,15 @@ describe("production Live scheduler", () => {
           masterArmed: true,
           strategies: {
             triangle: { enabled: false },
-            stablecoin: { enabled: true },
-            imbalance: { enabled: false }
+            gapTrading: { enabled: false },
+            imbalance: { enabled: true }
           }
         },
         evaluation: {
           strategies: {
             triangle: { canExecute: false, blockers: ["strategy-disabled"] },
-            stablecoin: { canExecute: true, blockers: [] },
-            imbalance: { canExecute: false, blockers: ["strategy-disabled"] }
+            gapTrading: { canExecute: false, blockers: ["strategy-disabled"] },
+            imbalance: { canExecute: true, blockers: [] }
           }
         }
       } as never),
@@ -137,8 +138,8 @@ describe("production Live scheduler", () => {
       },
       discoverStrategySignals: async () => [
         {
-          id: "ignored-imbalance",
-          kind: "orderbook-imbalance",
+          id: "gap:ignored:ask:1",
+          kind: "orderbook-gap",
           title: "ignored",
           symbols: ["BTCIRT"],
           action: "ignored",
@@ -152,10 +153,10 @@ describe("production Live scheduler", () => {
           scannedAt: 1_000
         },
         {
-          id: "stablecoin-best",
-          kind: "stablecoin",
-          title: "stablecoin",
-          symbols: ["USDTIRT"],
+          id: "imbalance:BTCIRT",
+          kind: "orderbook-imbalance",
+          title: "imbalance",
+          symbols: ["BTCIRT"],
           action: "buy",
           status: "actionable",
           paperOnly: true,
@@ -173,8 +174,188 @@ describe("production Live scheduler", () => {
       }
     }));
 
-    expect(event).toMatchObject({ outcome: "executed", strategy: "stablecoin", httpStatus: 200 });
+    expect(event).toMatchObject({ outcome: "executed", strategy: "imbalance", httpStatus: 200 });
     expect(triangleCalls).toBe(0);
-    expect(delegated).toEqual({ kind: "stablecoin", signalId: "stablecoin-best" });
+    expect(delegated).toEqual({ kind: "orderbook-imbalance", signalId: "imbalance:BTCIRT" });
+  });
+
+  test("AI Demo mode never suppresses an independently enabled Imbalance engine", async () => {
+    let delegated = 0;
+    let selected = 0;
+    const runtime = createLiveSchedulerRuntime(0);
+    const event = await runLiveSchedulerTick(runtime, dependencies({
+      getSettings: async () => ({
+        scanIntervalMs: 1_000,
+        aiAgent: { ...defaultAiAgentSettings, enabled: true, mode: "demo" }
+      }),
+      getRiskSnapshot: nonTriangleRisk,
+      discoverStrategySignals: async () => [strategySignal("imbalance:BTCIRT", "orderbook-imbalance", 100)],
+      selectAiCandidate: async () => { selected += 1; return { blockers: [] }; },
+      executeStrategy: async () => { delegated += 1; return Response.json({ status: "completed" }); }
+    }));
+
+    expect(event).toMatchObject({ outcome: "executed", strategy: "imbalance" });
+    expect(selected).toBe(0);
+    expect(delegated).toBe(1);
+  });
+
+  test("AI Live scans independently and delegates only the server-selected candidate", async () => {
+    let delegated: string | undefined;
+    let decision: string | undefined;
+    const chosen = aiCandidate("ETHIRT", 10);
+    const runtime = createLiveSchedulerRuntime(0);
+    const event = await runLiveSchedulerTick(runtime, dependencies({
+      getSettings: async () => ({
+        scanIntervalMs: 1_000,
+        aiAgent: { ...defaultAiAgentSettings, enabled: true, mode: "live" }
+      }),
+      getRiskSnapshot: aiOnlyRisk,
+      discoverAiCandidates: async () => [
+        aiCandidate("BTCIRT", 1_000),
+        chosen
+      ],
+      selectAiCandidate: async input => {
+        expect(input.candidates).toHaveLength(2);
+        return { selection: { candidate: chosen, probability: 0.82, features: zeroFeatures() }, blockers: [] };
+      },
+      recordAiDecision: async input => { decision = `${input.action}:${input.candidate?.id}`; },
+      executeAiCandidate: async candidateId => {
+        delegated = candidateId;
+        return Response.json({ status: "completed" });
+      }
+    }));
+
+    expect(event.outcome).toBe("executed");
+    expect(event.strategy).toBe("aiAgent");
+    expect(delegated).toBe("ai-market:ETHIRT");
+    expect(decision).toBe("executed:ai-market:ETHIRT");
   });
 });
+
+const nonTriangleRisk = async () => ({
+  state: {
+    masterArmed: true,
+    strategies: {
+      triangle: { enabled: false },
+      gapTrading: { enabled: false },
+      imbalance: { enabled: true }
+    }
+  },
+  evaluation: {
+    strategies: {
+      triangle: { canExecute: false, blockers: ["strategy-disabled"] },
+      gapTrading: { canExecute: false, blockers: ["strategy-disabled"] },
+      imbalance: { canExecute: true, blockers: [] }
+    }
+  }
+} as never);
+
+const aiOnlyRisk = async () => ({
+  state: {
+    masterArmed: true,
+    strategies: {
+      triangle: { enabled: false },
+      gapTrading: { enabled: false },
+      imbalance: { enabled: false },
+      aiAgent: { enabled: true }
+    }
+  },
+  evaluation: {
+    strategies: {
+      triangle: { canExecute: false, blockers: ["strategy-disabled"] },
+      gapTrading: { canExecute: false, blockers: ["strategy-disabled"] },
+      imbalance: { canExecute: false, blockers: ["strategy-disabled"] },
+      aiAgent: { canExecute: true, blockers: [] }
+    }
+  }
+} as never);
+
+function strategySignal(id: string, kind: "orderbook-gap" | "orderbook-imbalance", profit: number) {
+  return {
+    id,
+    kind,
+    title: id,
+    symbols: [id.split(":")[1] ?? "BTCIRT"],
+    action: "buy",
+    status: "actionable" as const,
+    paperOnly: true as const,
+    expectedEdgeBps: new Decimal(100),
+    estimatedNetProfitToman: new Decimal(profit),
+    confidence: new Decimal(80),
+    reasons: [],
+    metrics: {},
+    scannedAt: 1_000
+  };
+}
+
+function zeroFeatures() {
+  return {
+    expectedEdge: 0,
+    confidence: 0,
+    orderFlow: 0,
+    microprice: 0,
+    retention: 0,
+    spread: 0,
+    impact: 0,
+    roundTripCost: 0,
+    persistence: 0,
+    kind: 0
+  };
+}
+
+function aiCandidate(symbol: string, profit: number) {
+  return {
+    id: `ai-market:${symbol}`,
+    kind: "autonomous-market" as const,
+    source: "independent-orderbook-scanner" as const,
+    symbol,
+    base: symbol.replace(/IRT$/, ""),
+    quote: "IRT" as const,
+    direction: "LONG" as const,
+    scannedAt: 1_000,
+    bookLastUpdate: 1_000,
+    confidencePercent: 80,
+    expectedEdgeBps: 100,
+    estimatedNetProfitToman: profit,
+    projectedMoveBps: 150,
+    capitalToman: 100_000,
+    executable: true as const,
+    gatePassed: true,
+    blockers: [],
+    reasons: [],
+    rankScore: 90,
+    features: zeroFeatures(),
+    metrics: {
+      capitalToman: 100_000,
+      entryAssetAmount: 1,
+      immediateExitToman: 99_000,
+      bestBid: 99,
+      bestAsk: 100,
+      midpoint: 99.5,
+      microprice: 99.7,
+      micropriceBiasBps: 2,
+      multiLevelImbalance: 0.3,
+      snapshotOrderFlow: 0.1,
+      bidLiquidityRetentionPercent: 80,
+      spreadBps: 100,
+      entryPriceImpactBps: 0,
+      exitPriceImpactBps: 0,
+      maxPriceImpactBps: 0,
+      roundTripCostBps: 100,
+      visibleBidDepthToman: 1_000_000,
+      visibleAskDepthToman: 1_000_000,
+      entryDepthConsumedPercent: 1,
+      exitDepthConsumedPercent: 1,
+      entryAvailableInputToman: 1_000_000,
+      exitAvailableInputAsset: 10_000,
+      entryLevelsUsed: 1,
+      exitLevelsUsed: 1,
+      imbalanceRatio: 1.5,
+      dominantTopLevelSharePercent: 50,
+      bookAgeMs: 0,
+      historyTransitions: 3,
+      persistencePercent: 100,
+      persistenceMs: 5_000
+    }
+  };
+}

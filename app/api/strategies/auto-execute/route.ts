@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { handleSpotPositionRequest, isDashboardStrategyRequest } from "@/lib/strategies/spot-position-route";
-import { POST as executeStatisticalPairs } from "@/app/api/strategies/statistical-pairs/execute/route";
 import { findRecentStrategyExecution } from "@/lib/strategy-execution-store";
 import { getBotSettings } from "@/lib/bot-settings-store";
 
@@ -9,17 +8,13 @@ export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 const inputSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("stablecoin"), signalId: z.string().trim().regex(/^stablecoin:[A-Z0-9_-]+$/i).max(100) }).strict(),
   z.object({ kind: z.literal("orderbook-imbalance"), signalId: z.string().trim().regex(/^imbalance:[A-Z0-9_-]+IRT$/i).max(100) }).strict(),
-  z.object({ kind: z.literal("orderbook-gap"), signalId: z.string().trim().regex(/^gap:[A-Z0-9_-]+IRT:ask:\d+$/i).max(120) }).strict(),
-  z.object({ kind: z.literal("statistical-pairs"), signalId: z.string().trim().regex(/^pairs:[A-Z0-9_-]+:[A-Z0-9_-]+$/i).max(200) }).strict()
+  z.object({ kind: z.literal("orderbook-gap"), signalId: z.string().trim().regex(/^gap:[A-Z0-9_-]+IRT:ask:\d+$/i).max(120) }).strict()
 ]);
 
 const executionPolicy = {
-  stablecoin: { storeStrategy: "stablecoin" },
   "orderbook-imbalance": { storeStrategy: "imbalance" },
-  "orderbook-gap": { storeStrategy: "gapTrading" },
-  "statistical-pairs": { storeStrategy: "pairs" }
+  "orderbook-gap": { storeStrategy: "gapTrading" }
 } as const;
 
 /**
@@ -44,13 +39,9 @@ export async function POST(request: Request) {
 
   const policy = executionPolicy[input.kind];
   const settings = await getBotSettings();
-  const cooldownMs = input.kind === "stablecoin"
-    ? settings.strategyLab.stablecoin.cooldownMs
-    : input.kind === "orderbook-imbalance"
+  const cooldownMs = input.kind === "orderbook-imbalance"
       ? settings.strategyLab.imbalance.cooldownMs
-      : input.kind === "orderbook-gap"
-        ? settings.strategyLab.gapTrading.cooldownMs
-      : settings.strategyLab.pairs.cooldownMs;
+      : settings.strategyLab.gapTrading.cooldownMs;
   const recent = await findRecentStrategyExecution({
     strategy: policy.storeStrategy,
     signalId: input.signalId,
@@ -70,15 +61,8 @@ export async function POST(request: Request) {
 
   const headers = new Headers(request.headers);
   headers.set("content-type", "application/json");
-  const body = input.kind === "statistical-pairs"
-    ? { action: "enter", signalId: input.signalId }
-    : { signalId: input.signalId };
-  const delegated = new Request(request.url, { method: "POST", headers, body: JSON.stringify(body) });
-  return input.kind === "stablecoin"
-    ? handleSpotPositionRequest(delegated, "stablecoin")
-    : input.kind === "orderbook-imbalance"
+  const delegated = new Request(request.url, { method: "POST", headers, body: JSON.stringify({ signalId: input.signalId }) });
+  return input.kind === "orderbook-imbalance"
       ? handleSpotPositionRequest(delegated, "orderbook-imbalance")
-      : input.kind === "orderbook-gap"
-        ? handleSpotPositionRequest(delegated, "orderbook-gap")
-      : executeStatisticalPairs(delegated);
+      : handleSpotPositionRequest(delegated, "orderbook-gap");
 }

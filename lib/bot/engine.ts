@@ -6,6 +6,8 @@ import type { ConversionEdge, LegQuote, Opportunity } from "./types";
 const BPS = new Decimal(10_000);
 const MAX_FUTURE_BOOK_SKEW_MS = 1_000;
 const MAX_CROSS_BOOK_SKEW_MS = 1_000;
+const MAX_DEPTH_BREAKPOINTS_PER_LEG = 24;
+const DEPTH_BREAKPOINT_SEARCH_STEPS = 36;
 const CAPITAL_FRACTIONS = [
   "1", "0.95", "0.9", "0.85", "0.8", "0.75", "0.7", "0.65", "0.6", "0.55",
   "0.5", "0.45", "0.4", "0.35", "0.3", "0.25", "0.2", "0.15", "0.1", "0.05", "0.025", "0.01"
@@ -187,7 +189,12 @@ export function findTriangularOpportunitiesDetailed(input: ArbitrageSearchInput)
     else fastRejectedPathCount += 1;
 
     const evaluations: PathEvaluation[] = [];
-    const capitals = promising ? coarseCapitals : [...coarseCapitals].reverse();
+    const capitals = promising
+      ? mergeCapitals(
+        coarseCapitals,
+        depthBreakpointCapitals(path, requestedCapital, config)
+      )
+      : [...coarseCapitals].reverse();
     for (const capital of capitals) {
       evaluatedSizeCount += 1;
       const evaluation = evaluatePath(path, capital, requestedCapital, config);
@@ -198,7 +205,7 @@ export function findTriangularOpportunitiesDetailed(input: ArbitrageSearchInput)
 
     let selected = selectBestEvaluation(evaluations);
     if (promising && selected.liquiditySafe && selected.opportunity.netProfitToman.gt(0)) {
-      const refinements = refinementCapitals(selected.opportunity.inputToman, requestedCapital, input.options, coarseCapitals);
+      const refinements = refinementCapitals(selected.opportunity.inputToman, requestedCapital, input.options, capitals);
       if (refinements.length) refinedPathCount += 1;
       for (const capital of refinements) {
         evaluatedSizeCount += 1;
@@ -371,6 +378,155 @@ function candidateCapitals(capital: Decimal, options?: MarketOptions) {
 
   const unique = new Map<string, Decimal>();
   for (const value of candidates) unique.set(value.toSignificantDigits(18).toString(), value);
+  return [...unique.values()].sort((a, b) => b.comparedTo(a));
+}
+
+/**
+ * Adds the exact input sizes where any leg starts consuming the next orderbook
+ * level. Profit is piecewise linear between those boundaries, so evaluating
+ * only fixed percentages can miss the best executable size. Later-leg depth
+ * boundaries are mapped back to the initial IRT capital with a monotonic
+ * search through the preceding legs.
+ */
+function depthBreakpointCapitals(
+  path: [ConversionEdge, ConversionEdge, ConversionEdge],
+  requested: Decimal,
+  config: EvaluationConfig
+) {
+  const minimum = minimumCapital(requested, config.options);
+  const capitals: Decimal[] = [];
+
+  for (let legIndex = 0; legIndex < path.length; legIndex += 1) {
+    const reachable = maximumReachablePrefix(path, legIndex, minimum, requested, config);
+    if (!reachable) continue;
+    const thresholds = sampleDepthBreakpoints(
+      inputDepthBreakpoints(path[legIndex], config.depthUsagePercent, reachable.output),
+      MAX_DEPTH_BREAKPOINTS_PER_LEG
+    );
+
+    for (const threshold of thresholds) {
+      const capital = legIndex === 0
+        ? threshold
+        : capitalForPrefixInput(path, legIndex, threshold, minimum, reachable.capital, config);
+      if (capital && capital.gte(minimum) && capital.lte(requested)) capitals.push(capital);
+    }
+  }
+
+  return mergeCapitals(capitals);
+}
+
+function maximumReachablePrefix(
+  path: [ConversionEdge, ConversionEdge, ConversionEdge],
+  legIndex: number,
+  minimum: Decimal,
+  requested: Decimal,
+  config: EvaluationConfig
+) {
+  const requestedOutput = prefixInputAtCapital(path, legIndex, requested, config);
+  if (requestedOutput) return { capital: requested, output: requestedOutput };
+
+  let low = minimum;
+  let lowOutput = prefixInputAtCapital(path, legIndex, low, config);
+  if (!lowOutput) return undefined;
+  let high = requested;
+  for (let iteration = 0; iteration < DEPTH_BREAKPOINT_SEARCH_STEPS; iteration += 1) {
+    const middle = low.plus(high).div(2);
+    const output = prefixInputAtCapital(path, legIndex, middle, config);
+    if (output) {
+      low = middle;
+      lowOutput = output;
+    } else {
+      high = middle;
+    }
+  }
+  return { capital: low, output: lowOutput };
+}
+
+function capitalForPrefixInput(
+  path: [ConversionEdge, ConversionEdge, ConversionEdge],
+  legIndex: number,
+  target: Decimal,
+  minimum: Decimal,
+  maximum: Decimal,
+  config: EvaluationConfig
+) {
+  const minimumOutput = prefixInputAtCapital(path, legIndex, minimum, config);
+  const maximumOutput = prefixInputAtCapital(path, legIndex, maximum, config);
+  if (!minimumOutput || !maximumOutput || target.lt(minimumOutput) || target.gt(maximumOutput)) return undefined;
+  if (target.eq(minimumOutput)) return minimum;
+  if (target.eq(maximumOutput)) return maximum;
+
+  let low = minimum;
+  let high = maximum;
+  for (let iteration = 0; iteration < DEPTH_BREAKPOINT_SEARCH_STEPS; iteration += 1) {
+    const middle = low.plus(high).div(2);
+    const output = prefixInputAtCapital(path, legIndex, middle, config);
+    if (!output || output.gt(target)) high = middle;
+    else low = middle;
+  }
+  // Stay infinitesimally below the mapped boundary; returning the midpoint
+  // could cross into the next, worse level because of numerical tolerance.
+  return low;
+}
+
+function prefixInputAtCapital(
+  path: [ConversionEdge, ConversionEdge, ConversionEdge],
+  legIndex: number,
+  capital: Decimal,
+  config: EvaluationConfig
+) {
+  let current = capital;
+  for (let index = 0; index < legIndex; index += 1) {
+    const edge = path[index];
+    const quote = quoteEdge(
+      edge,
+      current,
+      edge.book.quote === "IRT" ? config.tomanFeeBps : config.usdtFeeBps,
+      config.slippageBps,
+      config.depthUsagePercent
+    );
+    if (!quote) return undefined;
+    current = quote.output;
+  }
+  return current;
+}
+
+function inputDepthBreakpoints(
+  edge: ConversionEdge,
+  depthUsagePercent: Decimal.Value,
+  maximumInput: Decimal
+) {
+  const ratio = new Decimal(depthUsagePercent).div(100);
+  if (ratio.lte(0) || ratio.gt(1)) return [];
+  const levels = executableLevels(edge);
+  const boundaries: Decimal[] = [];
+  let cumulative = new Decimal(0);
+  for (const level of levels) {
+    const inputCapacity = edge.side === "SELL"
+      ? level.amount.mul(ratio)
+      : level.amount.mul(level.price).mul(ratio);
+    cumulative = cumulative.plus(inputCapacity);
+    if (cumulative.gt(maximumInput)) break;
+    boundaries.push(cumulative);
+  }
+  return boundaries;
+}
+
+function sampleDepthBreakpoints(values: Decimal[], limit: number) {
+  if (values.length <= limit) return values;
+  const selected: Decimal[] = [];
+  for (let index = 0; index < limit; index += 1) {
+    selected.push(values[Math.round(index * (values.length - 1) / (limit - 1))]);
+  }
+  return selected;
+}
+
+function mergeCapitals(...groups: Decimal[][]) {
+  const unique = new Map<string, Decimal>();
+  for (const capital of groups.flat()) {
+    if (!capital.isFinite() || capital.lte(0)) continue;
+    unique.set(capital.toSignificantDigits(18).toString(), capital);
+  }
   return [...unique.values()].sort((a, b) => b.comparedTo(a));
 }
 

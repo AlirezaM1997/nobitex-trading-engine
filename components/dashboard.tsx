@@ -1,8 +1,9 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { AlertTriangle, ArrowLeft, BarChart3, CircleDollarSign, CircleHelp, Clock3, Coins, Gauge, LayoutDashboard, RefreshCw, Scale, Settings2, ShieldAlert, Trash2, TrendingDown, TrendingUp, WalletCards, Waves, Workflow } from "lucide-react";
+import { AlertTriangle, ArrowLeft, BrainCircuit, CircleHelp, Clock3, Coins, Gauge, LayoutDashboard, RefreshCw, Settings2, ShieldAlert, Trash2, TrendingDown, TrendingUp, WalletCards, Waves, Workflow } from "lucide-react";
 import type { BotSettings } from "@/lib/bot-settings";
+import AiAgentCenter from "@/components/ai-agent-center";
 import StrategyCenter, { type SerializedStrategySignal, type StrategyLabResult, type StrategyWorkspaceKey } from "@/components/strategy-center";
 import type { RiskStrategy } from "@/lib/risk/types";
 import RiskCenter, { type RiskSnapshotResponse } from "@/components/risk-center";
@@ -23,8 +24,8 @@ type StrategyExecutionRecord = { id: number; strategy: string; signalId: string 
 type StrategyExecutionHistory = { summary: { totalCount: number; activeCount: number; closedCount: number; failedManualCount: number; partiallyFilledCount: number; totalActualProfitToman: number }; records: StrategyExecutionRecord[] };
 type NumericKey = "paperCapitalToman" | "maxTradeToman" | "balanceUsagePercent" | "tomanTakerFeeBps" | "usdtTakerFeeBps" | "slippageBufferBps" | "liveSafetyBufferBps" | "maxPriceImpactBps" | "maxSpreadBps" | "orderbookDepthUsagePercent" | "minProfitBps" | "minNetProfitToman" | "orderbookMaxAgeMs" | "scanIntervalMs" | "orderTimeoutMs";
 type SettingField = { key: NumericKey; label: string; english: string; unit: string; description: string; increase: string; decrease: string; step?: number };
-type DashboardView = "overview" | "triangle" | "crossQuote" | "pairs" | "stablecoin" | "gapTrading" | "imbalance" | "risk";
-type EngineView = Exclude<DashboardView, "overview" | "risk">;
+type DashboardView = "overview" | "triangle" | "gapTrading" | "imbalance" | "aiAgent" | "risk";
+type EngineView = "triangle" | "gapTrading" | "imbalance";
 
 const format = (value: string | number, digits = 0) => new Intl.NumberFormat("fa-IR", { maximumFractionDigits: digits }).format(Number(value));
 const formatSettingNumber = (value: number) => new Intl.NumberFormat("en-US", {
@@ -46,9 +47,6 @@ const strategyExecutionStatusLabel: Record<StrategyExecutionState, string> = {
 
 const engineNavigation: Array<{ view: EngineView; title: string; english: string; icon: typeof LayoutDashboard; risk: RiskStrategy; workspace?: StrategyWorkspaceKey; storeStrategy?: string; signalKind?: SerializedStrategySignal["kind"] }> = [
   { view: "triangle", title: "آربیتراژ مثلثی", english: "Triangle", icon: Workflow, risk: "triangle" },
-  { view: "crossQuote", title: "آربیتراژ دو بازار", english: "Cross-Quote", icon: Scale, risk: "crossQuote", workspace: "crossQuote", storeStrategy: "crossQuote", signalKind: "cross-quote" },
-  { view: "pairs", title: "معاملات جفتی", english: "Pairs", icon: BarChart3, risk: "pairs", workspace: "pairs", storeStrategy: "pairs", signalKind: "statistical-pairs" },
-  { view: "stablecoin", title: "همگرایی استیبل", english: "Stablecoin", icon: CircleDollarSign, risk: "stablecoin", workspace: "stablecoin", storeStrategy: "stablecoin", signalKind: "stablecoin" },
   { view: "gapTrading", title: "شکاف اردربوک", english: "Orderbook Gap", icon: Gauge, risk: "gapTrading", workspace: "gapTrading", storeStrategy: "gapTrading", signalKind: "orderbook-gap" },
   { view: "imbalance", title: "عدم‌تعادل اردربوک", english: "Imbalance", icon: Waves, risk: "imbalance", workspace: "imbalance", storeStrategy: "imbalance", signalKind: "orderbook-imbalance" }
 ];
@@ -129,6 +127,7 @@ export default function Dashboard() {
   const [openSettingHint, setOpenSettingHint] = useState<NumericKey | null>(null);
   const [clearingHistory, setClearingHistory] = useState(false);
   const [clearingExecutionHistory, setClearingExecutionHistory] = useState(false);
+  const [purgingDatabase, setPurgingDatabase] = useState(false);
   const settingsRef = useRef<BotSettings | undefined>(undefined);
   const scanInFlight = useRef(false);
   const modeRef = useRef<"paper" | "live">("paper");
@@ -149,8 +148,8 @@ export default function Dashboard() {
     const syncHash = () => {
       const requested = window.location.hash.slice(1);
       const rawView = requested.startsWith("strategy-") ? requested.replace("strategy-", "") : requested;
-      const requestedView = ({ "cross-quote": "crossQuote", "market-making": "gapTrading", "orderbook-gap": "gapTrading" } as Record<string, string>)[rawView] ?? rawView;
-      if (["overview", "triangle", "crossQuote", "pairs", "stablecoin", "gapTrading", "imbalance", "risk"].includes(requestedView)) {
+      const requestedView = ({ "market-making": "gapTrading", "orderbook-gap": "gapTrading" } as Record<string, string>)[rawView] ?? rawView;
+      if (["overview", "triangle", "gapTrading", "imbalance", "aiAgent", "risk"].includes(requestedView)) {
         setActiveView(requestedView as DashboardView);
       }
     };
@@ -304,6 +303,40 @@ export default function Dashboard() {
     }
   }, []);
 
+  const purgeAllDatabaseData = useCallback(async () => {
+    if (riskSnapshot?.state.masterArmed) {
+      setError("برای حذف کامل دیتابیس ابتدا اجرای کلی معاملات واقعی را خاموش کنید.");
+      return;
+    }
+    if (!window.confirm("تمام فرصت‌ها، اجراها، سفارش‌ها، تغییر وضعیت‌ها و Audit Ledger برای همیشه حذف شوند؟ این عملیات قابل بازگشت نیست.")) return;
+    const phrase = window.prompt("برای تأیید نهایی عبارت DELETE ALL DATA را دقیقاً وارد کنید:");
+    if (phrase !== "DELETE ALL DATA") {
+      if (phrase !== null) setError("عبارت تأیید صحیح نبود؛ هیچ دیتایی حذف نشد.");
+      return;
+    }
+
+    setPurgingDatabase(true);
+    setError("");
+    try {
+      const response = await fetch("/api/admin/database", {
+        method: "DELETE",
+        headers: {
+          "content-type": "application/json",
+          "x-admin-action": "purge-all-database-data"
+        },
+        body: JSON.stringify({ confirmation: "DELETE_ALL_DATABASE_DATA" })
+      });
+      const json = await response.json();
+      if (!response.ok) throw new Error(json.error ?? "خطا در حذف کامل دیتابیس");
+      await Promise.all([fetchHistory(), fetchLiveExecutions(), fetchStrategyExecutions()]);
+      setExecutionMessage(`${format(Number(json.deleted?.total ?? 0))} رکورد دیتابیس برای همیشه حذف شد. تنظیمات، Risk State و اطلاعات اتصال حفظ شدند.`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "خطا در حذف کامل دیتابیس");
+    } finally {
+      setPurgingDatabase(false);
+    }
+  }, [fetchHistory, fetchLiveExecutions, fetchStrategyExecutions, riskSnapshot?.state.masterArmed]);
+
   useEffect(() => {
     void fetchHistory();
     void fetchLiveExecutions();
@@ -345,6 +378,11 @@ export default function Dashboard() {
   function updateStrategyLab(strategyLab: BotSettings["strategyLab"]) {
     setSaved(false);
     setSettings(current => current ? { ...current, strategyLab } : current);
+  }
+
+  function updateAiAgent(aiAgent: BotSettings["aiAgent"]) {
+    setSaved(false);
+    setSettings(current => current ? { ...current, aiAgent } : current);
   }
 
   function handleRiskSnapshot(next: RiskSnapshotResponse) {
@@ -397,10 +435,19 @@ export default function Dashboard() {
           : engineSignalCount(data?.strategyLab, engine);
         return <button type="button" key={engine.view} className={activeView === engine.view ? "active" : ""} onClick={() => { setActiveView(engine.view); window.history.replaceState(null, "", `#${engine.view}`); }} aria-current={activeView === engine.view ? "page" : undefined} title={engine.english}><Icon/><span>{engine.title}</span>{badge > 0 && <em>{format(badge)}</em>}</button>;
       })}
+      <button type="button" className={activeView === "aiAgent" ? "active" : ""} onClick={() => { setActiveView("aiAgent"); window.history.replaceState(null, "", "#aiAgent"); }} aria-current={activeView === "aiAgent" ? "page" : undefined} title="Autonomous Spot Agent"><BrainCircuit/><span>دستیار هوشمند</span></button>
       <button type="button" className={activeView === "risk" ? "active" : ""} onClick={() => { setActiveView("risk"); window.history.replaceState(null, "", "#risk"); }} aria-current={activeView === "risk" ? "page" : undefined}><ShieldAlert/><span>کنترل ریسک</span></button>
     </nav>
 
     {activeView === "risk" && <RiskCenter snapshot={riskSnapshot} onSnapshot={handleRiskSnapshot}/>} 
+
+    {activeView === "aiAgent" && settings && <AiAgentCenter
+      settings={settings.aiAgent}
+      saving={saving}
+      saved={saved}
+      onChange={updateAiAgent}
+      onOpenRisk={() => { setActiveView("risk"); window.history.replaceState(null, "", "#risk"); }}
+    />}
 
     {activeEngine && <>
       <section className="engine-workspace-banner panel"><div className="engine-workspace-title">{ActiveEngineIcon && <ActiveEngineIcon/>}<div><span className="eyebrow">ENGINE WORKSPACE</span><h2>{activeEngine.title}<small>{activeEngine.english}</small></h2></div></div><div className={`engine-workspace-state ${activeEngineStatus.tone}`}><span className={`status-dot ${activeEngineStatus.tone}`}/><b>{activeEngineStatus.label}</b></div></section>
@@ -438,6 +485,11 @@ export default function Dashboard() {
       {activeView === "overview" && <>
       <section className="stats"><article className={`balance-card ${balanceError ? "balance-error" : ""}`}><span><WalletCards/> ارزش کل کیف اسپات <button type="button" className="balance-refresh" onClick={() => void fetchBalance()} disabled={balanceLoading} title="به‌روزرسانی موجودی" aria-label="به‌روزرسانی موجودی"><RefreshCw className={balanceLoading ? "spin" : ""}/></button></span><b>{balanceError ? "خطا در دریافت موجودی" : balance ? `${format(balance.spotTotalToman)} تومان` : "در حال دریافت…"}</b>{balance && !balanceError && <small>تومان نقد آزاد: {format(balance.availableToman, 2)}</small>}{balanceError && <small title={balanceError}>{balanceError}</small>}</article><article><span>پوشش اسکن بازار</span><b>{format(data.marketCount)} بازار</b><small>{format(data.triangleCount)} چرخه · {format(data.evaluatedSizeCount)} سناریوی سرمایه · Engine {format(data.engineMs)}ms</small></article><article><span>کل تشخیص‌های سود مثبت</span><b>{format(history?.summary.detectionCount ?? 0)}</b><small>تاریخی و شامل مشاهده‌های تکراری</small></article><article><span>زمان اسکن</span><b>{new Date(data.scannedAt).toLocaleTimeString("fa-IR")}</b><small>{format(data.positiveCount)} مثبت · {format(data.liquiditySafePositiveCount)} نقدشونده · {format(data.refinedPathCount)} مسیر refine شده</small></article></section>
       <EngineManagementOverview engines={engineNavigation} risk={riskSnapshot} strategyLab={data.strategyLab} triangleActionableCount={data.executableCount} strategyExecutions={strategyExecutions} liveExecutions={liveExecutions} clearingHistory={clearingExecutionHistory} onClearHistory={() => void clearExecutionHistory()} onOpen={view => { setActiveView(view); window.history.replaceState(null, "", `#${view}`); }}/>
+      <section className="database-danger-zone panel">
+        <div className="database-danger-icon"><ShieldAlert/></div>
+        <div className="database-danger-content"><span className="eyebrow">DATABASE MANAGEMENT</span><h2>حذف کامل داده‌های دیتابیس</h2><p>همه فرصت‌ها، معاملات، Order IDها، رویدادهای وضعیت و Audit Ledger حذف می‌شوند. تنظیمات ربات، Risk State، موجودی صرافی و کلیدهای API دست‌نخورده می‌مانند.</p><small>فقط با اجرای کلی خاموش و بدون معامله، Recovery یا Lease فعال قابل انجام است.</small></div>
+        <button type="button" className="database-purge-button" onClick={() => void purgeAllDatabaseData()} disabled={purgingDatabase || riskSnapshot?.state.masterArmed} title={riskSnapshot?.state.masterArmed ? "ابتدا اجرای کلی معاملات واقعی را خاموش کنید" : "حذف دائمی همه رکوردهای دیتابیس"}><Trash2/>{purgingDatabase ? "در حال حذف…" : "حذف کامل دیتابیس"}</button>
+      </section>
       </>}
       {activeView === "triangle" && <>
       <section className="results"><div className="section-title"><div><span className="eyebrow">LIVE ORDER BOOK</span><h2>بهترین مسیرها</h2></div><span>{data.mode === "live" ? `اسکن واقعی با سقف ${format(data.capitalToman)} تومان` : `اسکن فرضی با سقف ${format(data.capitalToman)} تومان`} · عمق، اسپرد، اثر قیمت، کارمزد و لغزش لحاظ شده</span></div>

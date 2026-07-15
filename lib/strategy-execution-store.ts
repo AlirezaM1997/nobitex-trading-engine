@@ -548,6 +548,46 @@ export async function clearStrategyExecutionStore() {
 }
 
 /**
+ * Hard-deletes the complete strategy execution database. Production callers
+ * must use the guarded administrative route; normal history cleanup archives.
+ */
+export async function purgeAllStrategyExecutionData() {
+  const state = await database();
+  const executions = Number(state.db.exec("SELECT COUNT(*) FROM strategy_executions")[0]?.values[0]?.[0] ?? 0);
+  const orders = Number(state.db.exec("SELECT COUNT(*) FROM strategy_execution_orders")[0]?.values[0]?.[0] ?? 0);
+  const transitions = Number(state.db.exec("SELECT COUNT(*) FROM strategy_execution_transitions")[0]?.values[0]?.[0] ?? 0);
+  state.db.run("BEGIN IMMEDIATE");
+  try {
+    state.db.run("DELETE FROM strategy_execution_orders");
+    state.db.run("DELETE FROM strategy_execution_transitions");
+    state.db.run("DELETE FROM strategy_executions");
+    state.db.run("DELETE FROM sqlite_sequence WHERE name IN ('strategy_execution_orders', 'strategy_execution_transitions', 'strategy_executions')");
+    state.db.run("COMMIT");
+  } catch (error) {
+    state.db.run("ROLLBACK");
+    throw error;
+  }
+  persist(state);
+  return { executions, orders, transitions, total: executions + orders + transitions };
+}
+
+/** Includes hidden records and manual failures that still contain order evidence. */
+export async function countUnsafeStrategyExecutionRecords() {
+  const { db } = await database();
+  return Number(db.exec(`
+    SELECT COUNT(*) FROM strategy_executions execution
+    WHERE execution.state NOT IN ('CLOSED', 'FAILED_MANUAL')
+      OR (
+        execution.state = 'FAILED_MANUAL'
+        AND EXISTS (
+          SELECT 1 FROM strategy_execution_orders orders
+          WHERE orders.execution_id = execution.id
+        )
+      )
+  `)[0]?.values[0]?.[0] ?? 0);
+}
+
+/**
  * Archives rows that are safe to hide from the dashboard. Orders, transitions
  * and financially-final records stay immutable in SQLite for reconciliation.
  */

@@ -95,6 +95,34 @@ describe("triangular engine", () => {
     expect(result.stats.refinedPathCount).toBeGreaterThan(0);
   });
 
+  test("evaluates an exact first-leg depth boundary between fixed capital steps", () => {
+    const usdtIrt = book("USDTIRT", "USDT", "IRT", "99", "100", "5370");
+    usdtIrt.asks.push({ price: new Decimal("110"), amount: new Decimal("100000") });
+    const result = findTriangularOpportunitiesDetailed({
+      books: [usdtIrt, book("BTCUSDT", "BTC", "USDT", "0.999", "1"), book("BTCIRT", "BTC", "IRT", "102", "103")],
+      capitalToman: 1_000_000, now, tomanFeeBps: 0, usdtFeeBps: 0, slippageBps: 0,
+      maxPriceImpactBps: 10_000, maxSpreadBps: 200, depthUsagePercent: 100,
+      minProfitBps: 0, minNetProfitToman: 0, maxAgeMs: 1_000
+    });
+    const route = result.opportunities.find(item => item.route.join(",") === "IRT,USDT,BTC,IRT");
+    expect(route?.inputToman.toFixed(0)).toBe("537000");
+    expect(route?.netProfitToman.toFixed(0)).toBe("10740");
+  });
+
+  test("maps a middle-leg depth boundary back to the exact initial Toman size", () => {
+    const btcUsdt = book("BTCUSDT", "BTC", "USDT", "0.999", "1", "5370");
+    btcUsdt.asks.push({ price: new Decimal("1.1"), amount: new Decimal("100000") });
+    const result = findTriangularOpportunitiesDetailed({
+      books: [book("USDTIRT", "USDT", "IRT", "99", "100"), btcUsdt, book("BTCIRT", "BTC", "IRT", "102", "103")],
+      capitalToman: 1_000_000, now, tomanFeeBps: 0, usdtFeeBps: 0, slippageBps: 0,
+      maxPriceImpactBps: 10_000, maxSpreadBps: 200, depthUsagePercent: 100,
+      minProfitBps: 0, minNetProfitToman: 0, maxAgeMs: 1_000
+    });
+    const route = result.opportunities.find(item => item.route.join(",") === "IRT,USDT,BTC,IRT");
+    expect(route?.inputToman.toFixed(0)).toBe("537000");
+    expect(route?.netProfitToman.toFixed(0)).toBe("10740");
+  });
+
   test("uses one depth evaluation for paths whose best prices cannot be profitable", () => {
     const result = findTriangularOpportunitiesDetailed({
       books: [book("USDTIRT", "USDT", "IRT", "99", "100"), book("BTCUSDT", "BTC", "USDT", "49", "50"), book("BTCIRT", "BTC", "IRT", "4900", "5000")],

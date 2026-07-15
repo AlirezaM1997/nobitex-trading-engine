@@ -74,9 +74,9 @@ function restoreEnvironment(name: string, value: string | undefined) {
   else process.env[name] = value;
 }
 
-async function makePairsReady(now = Date.parse("2026-07-12T12:00:00.000Z")) {
+async function makeGapReady(now = Date.parse("2026-07-12T12:00:00.000Z")) {
   await configureRiskState({
-    strategies: { pairs: { enabled: true, readiness: ready } }
+    strategies: { gapTrading: { enabled: true, readiness: ready } }
   }, now);
   await armRiskControl(now);
 }
@@ -98,12 +98,8 @@ describe("persistent risk control", () => {
         executionAdapterReady: true
       }
     });
-    expect(state.strategies.crossQuote.readiness).toMatchObject({
-      positionStateReady: true,
-      recoveryReady: true,
-      executionAdapterReady: true
-    });
-    for (const strategy of ["pairs", "stablecoin", "gapTrading", "imbalance"] as const) {
+    expect("crossQuote" in state.strategies).toBe(false);
+    for (const strategy of ["gapTrading", "imbalance"] as const) {
       expect(state.strategies[strategy].readiness).toMatchObject({
         positionStateReady: true,
         recoveryReady: true,
@@ -131,10 +127,38 @@ describe("persistent risk control", () => {
 
     const state = await getRiskState(now);
     expect("marketMaking" in state.strategies).toBe(false);
+    expect("crossQuote" in state.strategies).toBe(false);
+    expect("pairs" in state.strategies).toBe(false);
+    expect("stablecoin" in state.strategies).toBe(false);
     expect(state.strategies.gapTrading).toMatchObject({
       enabled: false,
       readiness: { positionStateReady: true, recoveryReady: true, executionAdapterReady: true }
     });
+  });
+
+  test("normalizes a risk file after removed engines disappear from the strategy map", async () => {
+    const now = Date.parse("2026-07-12T12:00:00.000Z");
+    const currentFormat = {
+      version: 1,
+      masterArmed: false,
+      emergencyStop: { active: false, reason: null, triggeredAt: null },
+      daily: { date: "2026-07-12", realizedPnlToman: 0, lossToman: 0, tradeCount: 0, consecutiveLosses: 0 },
+      recordedPnlKeys: [],
+      limits: { maxDailyLossToman: 100_000, maxConcurrentPositions: 1, maxConsecutiveLosses: 1 },
+      strategies: {
+        triangle: { enabled: true, readiness: ready },
+        gapTrading: { enabled: true, readiness: ready },
+        imbalance: { enabled: true, readiness: ready }
+      },
+      updatedAt: new Date(now).toISOString()
+    };
+    await Bun.write(process.env.RISK_STATE_PATH!, JSON.stringify(currentFormat));
+
+    const state = await getRiskState(now);
+    expect(Object.keys(state.strategies).sort()).toEqual(["aiAgent", "gapTrading", "imbalance", "triangle"]);
+    expect(state.strategies.aiAgent.enabled).toBe(false);
+    expect(state.strategies.gapTrading.enabled).toBe(true);
+    expect(state.strategies.imbalance.enabled).toBe(true);
   });
 
   test("arms only after an enabled strategy passes every readiness gate", async () => {
@@ -142,11 +166,11 @@ describe("persistent risk control", () => {
     const snapshot = await getRiskControlSnapshot(Date.parse("2026-07-12T12:00:00.000Z"));
     expect(snapshot.state.masterArmed).toBe(true);
     expect(snapshot.evaluation.strategies.triangle.canExecute).toBe(true);
-    expect(snapshot.evaluation.strategies.crossQuote.canExecute).toBe(false);
+    expect("crossQuote" in snapshot.evaluation.strategies).toBe(false);
   });
 
   test("latches an emergency stop and reset does not silently re-arm", async () => {
-    await makePairsReady();
+    await makeGapReady();
     await emergencyStopRiskControl("operator-test", Date.parse("2026-07-12T12:01:00.000Z"));
     let state = await getRiskState(Date.parse("2026-07-12T12:01:00.000Z"));
     expect(state.masterArmed).toBe(false);
@@ -161,28 +185,28 @@ describe("persistent risk control", () => {
     const now = Date.parse("2026-07-12T12:00:00.000Z");
     await emergencyStopRiskControl("flatten-open-position", now);
 
-    const entry = await acquireExecutionLease({ strategy: "pairs", owner: "entry-worker", ttlMs: 5_000, now });
+    const entry = await acquireExecutionLease({ strategy: "gapTrading", owner: "entry-worker", ttlMs: 5_000, now });
     expect(entry).toMatchObject({
       acquired: false,
       reason: "risk-blocked",
       blockers: expect.arrayContaining(["master-not-armed", "emergency-stop-active"])
     });
 
-    const recovery = await acquireRecoveryLease({ strategy: "pairs", owner: "position:42", ttlMs: 5_000, now });
+    const recovery = await acquireRecoveryLease({ strategy: "gapTrading", owner: "position:42", ttlMs: 5_000, now });
     expect(recovery.acquired).toBe(true);
     if (!recovery.acquired) throw new Error("Expected a recovery lease");
-    expect(recovery.lease).toMatchObject({ strategy: "pairs", purpose: "recovery", owner: "position:42" });
+    expect(recovery.lease).toMatchObject({ strategy: "gapTrading", purpose: "recovery", owner: "position:42" });
     expect(await releaseExecutionLease(recovery.lease)).toBe(true);
   });
 
   test("allows an implemented Mainnet adapter while keeping its recovery lane available", async () => {
     const now = Date.parse("2026-07-12T12:00:00.000Z");
-    await configureRiskState({ strategies: { pairs: { enabled: true } } }, now);
+    await configureRiskState({ strategies: { gapTrading: { enabled: true } } }, now);
     await armRiskControl(now);
-    const entry = await acquireExecutionLease({ strategy: "pairs", owner: "pairs-entry", ttlMs: 5_000, now });
+    const entry = await acquireExecutionLease({ strategy: "gapTrading", owner: "gap-entry", ttlMs: 5_000, now });
     expect(entry.acquired).toBe(true);
     if (entry.acquired) await releaseExecutionLease(entry.lease);
-    const recovery = await acquireRecoveryLease({ strategy: "pairs", owner: "pairs-position:7", ttlMs: 5_000, now });
+    const recovery = await acquireRecoveryLease({ strategy: "gapTrading", owner: "gap-position:7", ttlMs: 5_000, now });
     expect(recovery.acquired).toBe(true);
     if (recovery.acquired) await releaseExecutionLease(recovery.lease);
   });
@@ -190,7 +214,7 @@ describe("persistent risk control", () => {
   test("persists daily PnL and trips the loss circuit breaker", async () => {
     await configureRiskState({
       limits: { maxDailyLossToman: 10_000, maxConsecutiveLosses: 10 },
-      strategies: { pairs: { enabled: true, readiness: ready } }
+      strategies: { gapTrading: { enabled: true, readiness: ready } }
     }, Date.parse("2026-07-12T12:00:00.000Z"));
     await armRiskControl(Date.parse("2026-07-12T12:00:00.000Z"));
     await recordRealizedPnl(-4_000, Date.parse("2026-07-12T12:01:00.000Z"));
@@ -206,7 +230,7 @@ describe("persistent risk control", () => {
     const now = Date.parse("2026-07-12T12:00:00.000Z");
     await configureRiskState({
       limits: { maxDailyLossToman: 1_000_000, maxConsecutiveLosses: 2 },
-      strategies: { pairs: { enabled: true, readiness: ready } }
+      strategies: { gapTrading: { enabled: true, readiness: ready } }
     }, now);
     await armRiskControl(now);
     await recordRealizedPnl(-1_000, now + 1_000, { executionId: "execution-42" });
@@ -288,7 +312,7 @@ describe("persistent risk control", () => {
 
   test("atomically rolls daily counters and disarms at the Tehran day boundary", async () => {
     const firstDay = Date.parse("2026-07-12T12:00:00.000Z");
-    await makePairsReady(firstDay);
+    await makeGapReady(firstDay);
     await recordRealizedPnl(5_000, firstDay);
     const nextDay = Date.parse("2026-07-13T12:00:00.000Z");
     const state = await getRiskState(nextDay);
@@ -306,7 +330,7 @@ describe("persistent risk control", () => {
 
   test("uses exclusive filesystem leases and releases only with the owner token", async () => {
     const now = Date.parse("2026-07-12T12:00:00.000Z");
-    await makePairsReady(now);
+    await makeGapReady(now);
     const [first, second] = await Promise.all([
       acquireExecutionLease({ strategy: "triangle", owner: "worker-a", ttlMs: 5_000, now }),
       acquireExecutionLease({ strategy: "triangle", owner: "worker-b", ttlMs: 5_000, now })
@@ -326,7 +350,7 @@ describe("persistent risk control", () => {
 
   test("allows an expired lease to be replaced", async () => {
     const now = Date.parse("2026-07-12T12:00:00.000Z");
-    await makePairsReady(now);
+    await makeGapReady(now);
     const first = await acquireExecutionLease({ strategy: "triangle", owner: "worker-a", ttlMs: 100, now });
     expect(first.acquired).toBe(true);
     const second = await acquireExecutionLease({ strategy: "triangle", owner: "worker-b", ttlMs: 1_000, now: now + 101 });

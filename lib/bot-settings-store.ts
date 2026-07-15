@@ -2,6 +2,11 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { botSettingsSchema, defaultBotSettings, type BotSettings } from "./bot-settings";
 import { defaultStrategyLabSettings } from "./strategy-settings";
+import { defaultAiAgentSettings } from "./ai-agent/settings";
+import {
+  applyAiAutopilotProfile,
+  inferAiAutopilotProfile
+} from "./ai-agent/autopilot-profiles";
 
 const settingsPath = path.join(process.cwd(), "data", "bot-settings.json");
 
@@ -18,9 +23,12 @@ export async function getBotSettings(): Promise<BotSettings> {
       liveSafetyBufferBps: stored.liveSafetyBufferBps ?? 150,
       strategyLab: stored.strategyLab === undefined
         ? defaultStrategyLabSettings
-        : migrateStoredStrategyLabSettings(stored.strategyLab)
+        : migrateStoredStrategyLabSettings(stored.strategyLab),
+      // Fail closed on upgrades: an old settings file can never opt itself
+      // into autonomous Demo or Live execution.
+      aiAgent: migrateStoredAiAgentSettings(stored.aiAgent)
     };
-    return botSettingsSchema.parse(migrated);
+    return normalizeAiAutopilot(botSettingsSchema.parse(migrated));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     await saveBotSettings(defaultBotSettings);
@@ -96,8 +104,24 @@ function nonNegativeNumber(value: unknown) {
 }
 
 export async function saveBotSettings(input: unknown): Promise<BotSettings> {
-  const settings = botSettingsSchema.parse(input);
+  const settings = normalizeAiAutopilot(botSettingsSchema.parse(input));
   await mkdir(path.dirname(settingsPath), { recursive: true });
   await writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   return settings;
+}
+
+export function migrateStoredAiAgentSettings(input: unknown): unknown {
+  if (input === undefined) return defaultAiAgentSettings;
+  if (!isRecord(input)) return input;
+  return {
+    ...input,
+    autopilotProfile: inferAiAutopilotProfile(input)
+  };
+}
+
+function normalizeAiAutopilot(settings: BotSettings): BotSettings {
+  return {
+    ...settings,
+    aiAgent: applyAiAutopilotProfile(settings.aiAgent)
+  };
 }

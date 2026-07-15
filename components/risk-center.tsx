@@ -69,39 +69,6 @@ const strategyMeta: Record<RiskStrategy, StrategyMeta> = {
     settingsHref: "#settings",
     settingsLabel: "تنظیمات Triangle"
   },
-  crossQuote: {
-    title: "آربیتراژ دو بازار",
-    english: "Cross-Quote Inventory",
-    mechanism: "قیمت همان دارایی در بازار IRT و USDT مقایسه می‌شود؛ برای حذف ریسک موجودی، اجرای واقعی همیشه ضلع تسویه USDT/IRT را هم اضافه و چرخه را با تومان می‌بندد.",
-    assets: "مبدأ و مقصد IRT است و دارایی و USDT فقط موجودی میانی همان اجرای ثبت‌شده هستند.",
-    entryExit: "ورود پس از بازاعتبارسنجی سه بازار، عمق، اسپرد، اثر قیمت و حاشیه Live است؛ نتیجه فقط پس از بازگشت به IRT به‌عنوان PnL ثبت می‌شود.",
-    recovery: "Inventory هر Fill جداگانه ثبت می‌شود؛ خطای ضلع دوم یا سوم دارایی‌های میانی را از بازار مستقیم IRT بازیابی می‌کند و اجرای رهاشده پس از Restart توقف اضطراری ایجاد می‌کند.",
-    risks: "تغییر نرخ USDT/IRT، Partial Fill، افت عمق و تأخیر API؛ به همین دلیل چرخه دو بار پیش از سفارش و بعد از هر Fill دوباره قیمت‌گذاری می‌شود.",
-    settingsHref: "#strategy-cross-quote",
-    settingsLabel: "تنظیمات Cross-Quote"
-  },
-  pairs: {
-    title: "معاملات جفتی آماری",
-    english: "Statistical Pairs",
-    mechanism: "رابطه تاریخی دو دارایی با OHLC، Beta و Z-Score سنجیده و روی واگرایی موقت یک Long و یک Short هم‌زمان ساخته می‌شود.",
-    assets: "سرمایه بر مبنای ارزش تومانی کنترل می‌شود، اما تا زمان خروج در دو پوزیشن Spot/Margin باقی می‌ماند.",
-    entryExit: "ورود در عبور Z-Score از Entry، خروج در بازگشت به Exit و توقف اجباری در Stop Z-Score یا شکست مدل است.",
-    recovery: "هر دو ضلع باید با وضعیت سفارش مستقل ردیابی شوند؛ در Fill نامتقارن، ضلع باز فوراً هج یا بسته می‌شود.",
-    risks: "Model Drift، کمبود امکان Short، لیکوییدیشن Margin، واگرایی پایدار و Fill نامتقارن. اجرای واقعی فقط با Position State و Recovery فعال مجاز است.",
-    settingsHref: "#strategy-pairs",
-    settingsLabel: "تنظیمات Pairs"
-  },
-  stablecoin: {
-    title: "همگرایی استیبل‌کوین",
-    english: "Stablecoin Convergence",
-    mechanism: "انحراف استیبل‌کوین‌ها از ارزش مرجع و از یکدیگر بررسی می‌شود تا بازگشت احتمالی قیمت معامله شود.",
-    assets: "نسخه اجرایی فعلی با تومان (IRT) وارد Spot می‌شود و هنگام خروج دوباره به تومان برمی‌گردد؛ پوزیشن می‌تواند تا Take Profit، Stop Loss یا Time Stop باز بماند.",
-    entryExit: "ورود پس از حداقل Deviation و کیفیت مناسب بازار؛ خروج هنگام همگرایی، Stop زمانی یا عبور انحراف از حد ریسک.",
-    recovery: "برای Depeg یا نبود نقدشوندگی باید خروج مرحله‌ای، سقف زمان نگهداری و تبدیل به دارایی مرجع اجرا شود.",
-    risks: "Depeg واقعی، ریسک صادرکننده، نبود بازار Short، اسپرد ناگهانی و قفل‌شدن نقدینگی. اجرای Long-only Mainnet با ثبت Position، خروج و Recovery انجام می‌شود.",
-    settingsHref: "#strategy-stablecoin",
-    settingsLabel: "تنظیمات Stablecoin"
-  },
   gapTrading: {
     title: "شکاف نقدشوندگی اردربوک",
     english: "Orderbook Gap / Liquidity Vacuum",
@@ -123,6 +90,17 @@ const strategyMeta: Record<RiskStrategy, StrategyMeta> = {
     risks: "سیگنال کاذب، دست‌کاری اردربوک، حرکت روندی، Latency و لغزش خروج. اجرای واقعی فقط با Position State، خروج حفاظتی و Recovery فعال می‌شود.",
     settingsHref: "#strategy-imbalance",
     settingsLabel: "تنظیمات Imbalance"
+  },
+  aiAgent: {
+    title: "دستیار مستقل بازار",
+    english: "Autonomous Spot Agent",
+    mechanism: "این موتور مستقیماً اردربوک همه بازارهای Spot تومانی را می‌خواند و بدون دریافت سیگنال از موتورهای شکاف یا عدم‌تعادل، فشار سفارش، Microprice، پایداری نقدینگی و هزینه قابل‌اجرای رفت‌وبرگشت را ارزیابی می‌کند.",
+    assets: "فقط بازارهای Spot با Quote تومانی بررسی می‌شوند؛ ورود از IRT و خروج نهایی دوباره به IRT است و Short مصنوعی ساخته نمی‌شود.",
+    entryExit: "ورود پس از اسکن مستقل، تأیید مدل، بازاسکن سروری و دو مرحله بازاعتبارسنجی عمق انجام می‌شود؛ Take Profit، Stop Loss و Time Stop خروج را کنترل می‌کنند.",
+    recovery: "هر سفارش و پوزیشن پیش از ارسال در لاگ پایدار ثبت می‌شود و پس از خطا یا Restart فقط موجودی اثبات‌شده با Order ID و Recovery Lease به IRT برمی‌گردد.",
+    risks: "مدل احتمالاتی است و سود تضمین نمی‌شود. تغییر رژیم بازار، نقدینگی نمایشی، Latency و لغزش خروج می‌توانند نتیجه واقعی را از پیش‌بینی متفاوت کنند.",
+    settingsHref: "#aiAgent",
+    settingsLabel: "تنظیمات AI Agent"
   }
 };
 

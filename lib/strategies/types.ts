@@ -2,7 +2,7 @@ import Decimal from "decimal.js";
 import type { StrategyLabSettings } from "@/lib/strategy-settings";
 import type { OrderbookObservation } from "./orderbook-history";
 
-export type StrategyKind = "cross-quote" | "statistical-pairs" | "stablecoin" | "orderbook-gap" | "orderbook-imbalance";
+export type StrategyKind = "orderbook-gap" | "orderbook-imbalance";
 export type StrategySignalStatus = "actionable" | "watch" | "blocked";
 
 export type StrategySignal = {
@@ -23,13 +23,6 @@ export type StrategySignal = {
   scannedAt: number;
 };
 
-export type StatisticalPairSeries = {
-  assetA: string;
-  assetB: string;
-  pricesA: Decimal.Value[];
-  pricesB: Decimal.Value[];
-};
-
 export type StrategyLabConfig = {
   settings: StrategyLabSettings;
   tomanTakerFeeBps: number;
@@ -40,7 +33,6 @@ export type StrategyLabConfig = {
 
 export type StrategyLabContext = {
   now?: number;
-  statisticalPairs?: StatisticalPairSeries[];
   orderbookHistory?: ReadonlyMap<string, readonly OrderbookObservation[]>;
 };
 

@@ -31,11 +31,9 @@ const IMPLEMENTED_READINESS: Record<RiskStrategy, Pick<StrategyReadiness,
   "positionStateReady" | "recoveryReady" | "executionAdapterReady"
 >> = {
   triangle: { positionStateReady: true, recoveryReady: true, executionAdapterReady: true },
-  crossQuote: { positionStateReady: true, recoveryReady: true, executionAdapterReady: true },
-  pairs: { positionStateReady: true, recoveryReady: true, executionAdapterReady: true },
-  stablecoin: { positionStateReady: true, recoveryReady: true, executionAdapterReady: true },
   gapTrading: { positionStateReady: true, recoveryReady: true, executionAdapterReady: true },
-  imbalance: { positionStateReady: true, recoveryReady: true, executionAdapterReady: true }
+  imbalance: { positionStateReady: true, recoveryReady: true, executionAdapterReady: true },
+  aiAgent: { positionStateReady: true, recoveryReady: true, executionAdapterReady: true }
 };
 
 const readinessSchema = z.object({
@@ -214,18 +212,20 @@ async function readStoredState(now: Date | number): Promise<RiskState> {
     const rawStrategies = raw.strategies && typeof raw.strategies === "object" && !Array.isArray(raw.strategies)
       ? raw.strategies as Record<string, unknown>
       : undefined;
-    // Market Making never had a live adapter. Do not carry its enabled flag to
-    // the new, unrelated Gap engine: the new engine must start fail-closed.
-    const migrated = rawStrategies && !("gapTrading" in rawStrategies) && "marketMaking" in rawStrategies
+    // Rebuild the strategy map from the current allow-list on every read. This
+    // drops engines removed by an upgrade and supplies a fail-closed state for
+    // a newly introduced/missing engine. Without this normalization, an older
+    // build and a newer risk-state file can disagree about required keys.
+    const migrated = rawStrategies
       ? {
           ...raw,
-          strategies: {
-            ...Object.fromEntries(Object.entries(rawStrategies).filter(([key]) => key !== "marketMaking")),
-            gapTrading: {
+          strategies: Object.fromEntries(RISK_STRATEGIES.map(strategy => [
+            strategy,
+            rawStrategies[strategy] ?? {
               enabled: false,
-              readiness: { ...emptyReadiness(), ...IMPLEMENTED_READINESS.gapTrading }
+              readiness: { ...emptyReadiness(), ...IMPLEMENTED_READINESS[strategy] }
             }
-          }
+          ]))
         }
       : raw;
     const parsed = riskStateSchema.safeParse(migrated);

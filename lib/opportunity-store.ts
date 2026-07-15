@@ -208,6 +208,31 @@ export async function clearOpportunityHistory() {
   return count;
 }
 
+/**
+ * Permanently removes every row owned by the opportunity/triangle database.
+ * This is intentionally separate from dashboard history archival and must only
+ * be called by the guarded administrative purge route.
+ */
+export async function purgeAllOpportunityDatabaseData() {
+  const state = await database();
+  ensureOpportunityHistorySchema(state.db);
+  ensureLiveExecutionSchema(state.db);
+  const opportunities = Number(state.db.exec("SELECT COUNT(*) FROM profitable_opportunities")[0]?.values[0]?.[0] ?? 0);
+  const liveExecutions = Number(state.db.exec("SELECT COUNT(*) FROM live_executions")[0]?.values[0]?.[0] ?? 0);
+  state.db.run("BEGIN IMMEDIATE");
+  try {
+    state.db.run("DELETE FROM profitable_opportunities");
+    state.db.run("DELETE FROM live_executions");
+    state.db.run("DELETE FROM sqlite_sequence WHERE name IN ('profitable_opportunities', 'live_executions')");
+    state.db.run("COMMIT");
+  } catch (error) {
+    state.db.run("ROLLBACK");
+    throw error;
+  }
+  persist(state);
+  return { opportunities, liveExecutions, total: opportunities + liveExecutions };
+}
+
 export async function getOpportunityHistory(limit = 50) {
   const safeLimit = Math.max(1, Math.min(200, Math.floor(limit)));
   const { db } = await database();
@@ -468,6 +493,21 @@ export async function getUnfinishedLiveExecutions(): Promise<UnfinishedLiveExecu
   }
   statement.free();
   return records;
+}
+
+/** Includes hidden/failed rows whose order evidence may still represent exposure. */
+export async function countUnsafeLiveExecutionRecords() {
+  const { db } = await database();
+  ensureLiveExecutionSchema(db);
+  return Number(db.exec(`
+    SELECT COUNT(*) FROM live_executions
+    WHERE status IN ('PREPARING', 'RUNNING')
+      OR (
+        status = 'FAILED'
+        AND actual_output_toman IS NULL
+        AND TRIM(COALESCE(orders_json, '[]')) <> '[]'
+      )
+  `)[0]?.values[0]?.[0] ?? 0);
 }
 
 function parsePersistedOrders(value: unknown): { orders: unknown[]; corrupt: boolean } {

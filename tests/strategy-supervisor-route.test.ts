@@ -18,7 +18,6 @@ function dependencies(overrides: Record<string, unknown> = {}) {
   return {
     isMainnet: () => true,
     listExecutions: async () => ({ summary: {}, records: [] }),
-    monitorPairs: async () => Response.json({ status: "idle" }),
     recoverSpot: async () => Response.json({ status: "not-called" }),
     ...overrides
   } as never;
@@ -40,7 +39,7 @@ describe("durable strategy supervisor", () => {
   test("delegates active Spot records to the child route that owns record fencing", async () => {
     let recoveries = 0;
     const response = await handleStrategySupervisor(request(), dependencies({
-      listExecutions: async () => ({ records: [{ id: 5, strategy: "stablecoin", signalId: "stablecoin:USDC", state: "HEDGING", updatedAt: 1 }] }),
+      listExecutions: async () => ({ records: [{ id: 5, strategy: "gapTrading", signalId: "gap:XIRT:ask:2", state: "HEDGING", updatedAt: 1 }] }),
       recoverSpot: async () => { recoveries += 1; return Response.json({ status: "busy", code: "POSITION_ALREADY_OWNED" }, { status: 409 }); }
     }));
     expect(response.status).toBe(200);
@@ -63,22 +62,38 @@ describe("durable strategy supervisor", () => {
     expect(body).toEqual({ signalId: "imbalance:BTCIRT" });
   });
 
+  test("delegates an orphaned autonomous AI position to its durable recovery route", async () => {
+    let kind = "";
+    let body: unknown;
+    const response = await handleStrategySupervisor(request(), dependencies({
+      listExecutions: async () => ({ records: [{ id: 8, strategy: "aiAgent", signalId: "ai-market:BTCIRT", state: "RECOVERING", updatedAt: 1 }] }),
+      recoverSpot: async (child: Request, value: string) => {
+        kind = value;
+        body = await child.json();
+        return Response.json({ status: "recovered", executionId: 8 });
+      }
+    }));
+    expect(response.status).toBe(200);
+    expect(kind).toBe("ai-autonomous");
+    expect(body).toEqual({ signalId: "ai-market:BTCIRT" });
+  });
+
   test("a busy old position does not starve a later orphan", async () => {
     const seen: string[] = [];
     const response = await handleStrategySupervisor(request(), dependencies({
       listExecutions: async () => ({ records: [
-        { id: 1, strategy: "stablecoin", signalId: "stablecoin:USDC", state: "HEDGING", updatedAt: 1 },
+        { id: 1, strategy: "gapTrading", signalId: "gap:XIRT:ask:2", state: "HEDGING", updatedAt: 1 },
         { id: 2, strategy: "imbalance", signalId: "imbalance:ETHIRT", state: "RECOVERING", updatedAt: 2 }
       ] }),
       recoverSpot: async (child: Request) => {
         const input = await child.json() as { signalId: string };
         seen.push(input.signalId);
-        return input.signalId === "stablecoin:USDC"
+        return input.signalId === "gap:XIRT:ask:2"
           ? Response.json({ status: "busy" }, { status: 409 })
           : Response.json({ status: "recovered" });
       }
     }));
     expect(response.status).toBe(200);
-    expect(seen).toEqual(["stablecoin:USDC", "imbalance:ETHIRT"]);
+    expect(seen).toEqual(["gap:XIRT:ask:2", "imbalance:ETHIRT"]);
   });
 });

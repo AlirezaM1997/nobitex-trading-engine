@@ -5,12 +5,10 @@ import type { OrderbookObservation } from "@/lib/strategies/orderbook-history";
 import { clearOrderbookObservations, recordOrderbookObservations } from "@/lib/strategies/orderbook-history";
 import { defaultStrategyLabSettings } from "@/lib/strategy-settings";
 import {
-  analyzeStatisticalPair,
-  scanCrossQuoteInventory,
-  scanOrderbookImbalance,
-  scanStablecoinConvergence
+  scanOrderbookImbalance
 } from "@/lib/strategies/engine";
 import { measureAdjacentOrderbookGaps, scanOrderbookGaps } from "@/lib/strategies/orderbook-gap";
+import { measureSnapshotOrderFlow, summarizeSnapshotOrderFlow } from "@/lib/strategies/orderbook-imbalance";
 
 const now = 1_800_000_000_000;
 const book = (symbol: string, base: string, quote: string, bid: number, ask: number, bidAmount = 1_000_000, askAmount = bidAmount): OrderBook => ({
@@ -42,67 +40,6 @@ describe("strategy lab", () => {
     const history = recordOrderbookObservations([snapshot], now, { minSampleGapMs: 100 });
     expect(history.get("XIRT")).toHaveLength(1);
   });
-  test("finds a cross-quote inventory rotation relative to direct USDT conversion", () => {
-    const settings = { ...defaultStrategyLabSettings, crossQuote: { ...defaultStrategyLabSettings.crossQuote, capitalToman: 100_000, minEdgeBps: 80, maxSpreadBps: 200, depthUsagePercent: 100 } };
-    const signals = scanCrossQuoteInventory([
-      book("USDTIRT", "USDT", "IRT", 99.9, 100),
-      book("XIRT", "X", "IRT", 999, 1000),
-      book("XUSDT", "X", "USDT", 11, 11.01)
-    ], { ...config, settings }, now);
-    expect(signals.some(signal => signal.status === "actionable" && signal.expectedEdgeBps.gt(0))).toBe(true);
-  });
-
-  test("computes beta and flags an extreme statistical spread", () => {
-    const pricesB = Array.from({ length: 60 }, (_, index) => new Decimal(100 + index));
-    const pricesA = pricesB.map((value, index) => value.mul(index === 59 ? 3 : 2));
-    const signal = analyzeStatisticalPair({ assetA: "BTC", assetB: "ETH", pricesA, pricesB }, config, now);
-    expect(signal).toBeDefined();
-    expect(["actionable", "blocked"]).toContain(signal!.status);
-    expect(Math.abs(Number(signal!.metrics.zScore))).toBeGreaterThan(2);
-  });
-
-  test("blocks a negatively related pair instead of treating correlation as a tradable hedge", () => {
-    const pricesB = Array.from({ length: 80 }, (_, index) => new Decimal(100 + index));
-    const pricesA = Array.from({ length: 80 }, (_, index) => new Decimal(300 - index));
-    const signal = analyzeStatisticalPair({ assetA: "A", assetB: "B", pricesA, pricesB }, config, now);
-    expect(signal).toBeDefined();
-    expect(Number(signal!.metrics.beta)).toBeLessThan(0);
-    expect(signal!.metrics.modelValidated).toBe(false);
-    expect(signal!.status).toBe("blocked");
-  });
-
-  test("detects stablecoin convergence only after costs", () => {
-    const settings = { ...defaultStrategyLabSettings, stablecoin: { ...defaultStrategyLabSettings.stablecoin, assets: "USDC", minDeviationBps: 100, maxSpreadBps: 100, capitalToman: 500_000 } };
-    const signals = scanStablecoinConvergence([
-      book("USDTIRT", "USDT", "IRT", 99.9, 100.1),
-      book("USDCIRT", "USDC", "IRT", 94.9, 95.1)
-    ], { ...config, settings }, now);
-    expect(signals[0]?.status).toBe("actionable");
-    expect(signals[0]?.action).toContain("Buy USDC");
-  });
-
-  test("keeps a stablecoin discount on watch when entry and exit depth cannot fill the configured capital", () => {
-    const settings = {
-      ...defaultStrategyLabSettings,
-      stablecoin: {
-        ...defaultStrategyLabSettings.stablecoin,
-        assets: "USDC",
-        minDeviationBps: 100,
-        maxSpreadBps: 100,
-        maxPriceImpactBps: 100,
-        capitalToman: 500_000,
-        depthUsagePercent: 40
-      }
-    };
-    const signals = scanStablecoinConvergence([
-      book("USDTIRT", "USDT", "IRT", 99.9, 100.1, 100_000),
-      book("USDCIRT", "USDC", "IRT", 94.9, 95.1, 1)
-    ], { ...config, settings }, now);
-    expect(signals[0]?.status).toBe("watch");
-    expect(signals[0]?.metrics.executionDepthSafe).toBe(false);
-    expect(signals[0]?.reasons[0]).toContain("depth");
-  });
-
   test("measures adjacent price gaps with a robust median/MAD baseline", () => {
     const gapBook: OrderBook = {
       symbol: "XIRT", base: "X", quote: "IRT", lastUpdate: now,
@@ -113,6 +50,25 @@ describe("strategy lab", () => {
     expect(measured.candidate.index).toBe(2);
     expect(measured.candidate.gapBps.gt(300)).toBe(true);
     expect(measured.candidate.robustZScore.gt(3)).toBe(true);
+  });
+
+  test("measures bullish multi-level snapshot order flow instead of only static depth", () => {
+    const previous = depthBook(99, 101, [1_000, 1_000, 1_000], [1_000, 1_000, 1_000]);
+    const current = depthBook(99, 101, [2_000, 1_500, 1_000], [500, 750, 1_000]);
+    const flow = measureSnapshotOrderFlow(previous, current, 3, 70);
+    expect(flow.normalizedFlow.gt(0)).toBe(true);
+    expect(flow.bidLiquidityRetentionPercent.toNumber()).toBe(100);
+  });
+
+  test("detects fleeting liquidity when a wall moves to different prices", () => {
+    const previous = depthBook(99, 101, [5_000, 5_000, 5_000], [1_000, 1_000, 1_000]);
+    const moved = depthBook(89, 111, [5_000, 5_000, 5_000], [1_000, 1_000, 1_000]);
+    const summary = summarizeSnapshotOrderFlow([
+      { observedAt: now - 1_000, book: previous },
+      { observedAt: now, book: moved }
+    ], 3, 70);
+    expect(summary.sampleCount).toBe(1);
+    expect(summary.bidLiquidityRetentionPercent.toNumber()).toBe(0);
   });
 
   test("keeps a persistent ask gap on watch until forward outcomes are calibrated", () => {
@@ -131,6 +87,9 @@ describe("strategy lab", () => {
         minGapZScore: 3,
         minConfirmations: 2,
         minPersistenceMs: 1_000,
+        minFlowSamples: 0,
+        minOrderFlowImbalance: 0,
+        minBidLiquidityRetentionPercent: 0,
         minBidSupportRatio: 1,
         minMicropriceBiasBps: 0,
         maxTopLevelSharePercent: 100,
@@ -153,7 +112,7 @@ describe("strategy lab", () => {
     expect(signal?.status).toBe("watch");
     expect(signal?.metrics.analyticalSetupPassed).toBe(true);
     expect(signal?.metrics.spotExecutable).toBe(false);
-    expect(signal?.metrics.liveBlocker).toBe("forward-outcome-calibration-incomplete");
+    expect(signal?.metrics.liveBlocker).toBe("outcomeCalibrated");
   });
 
   test("blocks a bid-side liquidity gap because Spot cannot short it", () => {
@@ -170,7 +129,7 @@ describe("strategy lab", () => {
   });
 
   test("detects deep orderbook imbalance without claiming guaranteed profit", () => {
-    const settings = { ...defaultStrategyLabSettings, imbalance: { ...defaultStrategyLabSettings.imbalance, levels: 1, capitalToman: 5_000, minVisibleDepthToman: 1_000, maxSpreadBps: 500, minRatio: 2, minConfirmations: 1, minOutcomeSamples: 0, minPersistenceMs: 0, minPressureDelta: 0, maxTopLevelSharePercent: 100, minMicropriceBiasBps: 0, stopLossBps: 500 } };
+    const settings = { ...defaultStrategyLabSettings, imbalance: { ...defaultStrategyLabSettings.imbalance, levels: 1, capitalToman: 5_000, minVisibleDepthToman: 1_000, maxSpreadBps: 500, minRatio: 2, minConfirmations: 1, minOutcomeSamples: 0, minPersistenceMs: 0, minPressureDelta: 0, minFlowSamples: 0, minOrderFlowImbalance: 0, minDominantLiquidityRetentionPercent: 0, maxTopLevelSharePercent: 100, minMicropriceBiasBps: 0, stopLossBps: 500 } };
     const signals = scanOrderbookImbalance([book("XIRT", "X", "IRT", 99, 101, 1_000, 100)], { ...config, settings }, now);
     expect(signals[0]?.status).toBe("actionable");
     expect(signals[0]?.estimatedNetProfitToman.toString()).toBe("0");
@@ -190,6 +149,9 @@ describe("strategy lab", () => {
         minConfirmations: 1,
         minPersistenceMs: 0,
         minPressureDelta: 0,
+        minFlowSamples: 0,
+        minOrderFlowImbalance: 0,
+        minDominantLiquidityRetentionPercent: 0,
         maxTopLevelSharePercent: 100,
         minMicropriceBiasBps: 0,
         stopLossBps: 80,
@@ -254,7 +216,7 @@ describe("strategy lab", () => {
   });
 
   test("rejects an imbalance concentrated in one spoofable top-level wall", () => {
-    const settings = { ...defaultStrategyLabSettings, imbalance: { ...defaultStrategyLabSettings.imbalance, levels: 3, capitalToman: 50_000, minVisibleDepthToman: 1_000, maxSpreadBps: 500, minRatio: 2, minConfirmations: 1, minPersistenceMs: 0, minPressureDelta: 0, maxTopLevelSharePercent: 70, minMicropriceBiasBps: 0 } };
+    const settings = { ...defaultStrategyLabSettings, imbalance: { ...defaultStrategyLabSettings.imbalance, levels: 3, capitalToman: 50_000, minVisibleDepthToman: 1_000, maxSpreadBps: 500, minRatio: 2, minConfirmations: 1, minPersistenceMs: 0, minPressureDelta: 0, minFlowSamples: 0, minOrderFlowImbalance: 0, minDominantLiquidityRetentionPercent: 0, maxTopLevelSharePercent: 70, minMicropriceBiasBps: 0 } };
     const wall = depthBook(99, 101, [5_000, 10, 10], [1_000, 1_000, 1_000]);
     const signal = scanOrderbookImbalance([wall], { ...config, settings }, now)[0];
     expect(signal?.status).toBe("watch");

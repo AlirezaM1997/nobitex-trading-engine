@@ -23,31 +23,31 @@ import type { StrategySignal } from "@/lib/strategies/types";
 
 const now = 1_800_000_000_000;
 
-function book(symbol: string, base: string, bid: number, ask: number): OrderBook {
+function book(symbol: string, base: string, bid: number, ask: number, bidAmount = 100_000, askAmount = 100_000): OrderBook {
   return {
     symbol,
     base,
     quote: "IRT",
     lastUpdate: now,
-    bids: [{ price: new Decimal(bid), amount: new Decimal(100_000) }],
-    asks: [{ price: new Decimal(ask), amount: new Decimal(100_000) }]
+    bids: [{ price: new Decimal(bid), amount: new Decimal(bidAmount) }],
+    asks: [{ price: new Decimal(ask), amount: new Decimal(askAmount) }]
   };
 }
 
-const books = [book("USDCIRT", "USDC", 90, 91), book("USDTIRT", "USDT", 100, 101)];
+const books = [book("XIRT", "X", 99, 100, 300_000, 100_000)];
 const signal: StrategySignal = {
-  id: "stablecoin:USDC",
-  kind: "stablecoin",
-  title: "USDC convergence",
-  symbols: ["USDCIRT", "USDTIRT"],
+  id: "imbalance:XIRT",
+  kind: "orderbook-imbalance",
+  title: "X imbalance",
+  symbols: ["XIRT"],
   action: "BUY",
   status: "actionable",
   paperOnly: true,
-  expectedEdgeBps: new Decimal(800),
-  estimatedNetProfitToman: new Decimal(8_000),
+  expectedEdgeBps: new Decimal(100),
+  estimatedNetProfitToman: new Decimal(1_000),
   confidence: new Decimal(80),
   reasons: [],
-  metrics: { direction: "LONG", spotExecutable: true, deviationBps: -950, capitalToman: 100_000 },
+  metrics: { direction: "LONG", spotExecutable: true, ratio: 3, capitalToman: 100_000, temporalConfirmed: true, spoofingGuardPassed: true, priceConfirmationPassed: true, executionDepthSafe: true },
   scannedAt: now
 };
 
@@ -56,15 +56,19 @@ const settings = {
   liveSafetyBufferBps: 0,
   strategyLab: {
     ...defaultBotSettings.strategyLab,
-    stablecoin: {
-      ...defaultBotSettings.strategyLab.stablecoin,
-      assets: "USDC",
+    imbalance: {
+      ...defaultBotSettings.strategyLab.imbalance,
       capitalToman: 100_000,
-      minDeviationBps: 100,
-      exitDeviationBps: 25,
       maxSpreadBps: 500,
       maxPriceImpactBps: 50,
       depthUsagePercent: 100,
+      levels: 1,
+      levelWeightDecayPercent: 70,
+      minRatio: 2,
+      exitRatio: 1.25,
+      minVisibleDepthToman: 50_000,
+      maxTopLevelSharePercent: 100,
+      minMicropriceBiasBps: 0,
       takeProfitBps: 50,
       stopLossBps: 100,
       maxLossToman: 5_000,
@@ -74,10 +78,10 @@ const settings = {
   }
 };
 
-function plan() {
-  const s = settings.strategyLab.stablecoin;
+function plan(capitalToman: Decimal.Value = settings.strategyLab.imbalance.capitalToman) {
+  const s = settings.strategyLab.imbalance;
   return createSpotPositionExecutionPlan(signal, {
-    capitalToman: s.capitalToman,
+    capitalToman,
     tomanTakerFeeBps: 0,
     slippageBps: 0,
     liveSafetyBufferBps: 0,
@@ -96,12 +100,12 @@ function plan() {
     recoveryMaxSpreadBps: s.recoveryMaxSpreadBps,
     recoveryMaxPriceImpactBps: s.recoveryMaxPriceImpactBps,
     recoverySlippageBps: s.recoverySlippageBps,
-    stablecoin: { minDeviationBps: s.minDeviationBps, exitDeviationBps: s.exitDeviationBps }
+    imbalance: { levels: s.levels, levelWeightDecayPercent: s.levelWeightDecayPercent, minRatio: s.minRatio, exitRatio: s.exitRatio, minVisibleDepthToman: s.minVisibleDepthToman, maxTopLevelSharePercent: s.maxTopLevelSharePercent, minMicropriceBiasBps: s.minMicropriceBiasBps }
   }, now);
 }
 
 function request(body: unknown, path = "execute", origin = "http://localhost") {
-  return new Request(`http://localhost/api/strategies/stablecoin/${path}`, {
+  return new Request(`http://localhost/api/strategies/orderbook-imbalance/${path}`, {
     method: "POST",
     headers: { "content-type": "application/json", host: "localhost", origin, "x-strategy-action": "nobitex-dashboard" },
     body: JSON.stringify(body)
@@ -110,8 +114,8 @@ function request(body: unknown, path = "execute", origin = "http://localhost") {
 
 function dependencies(overrides: Partial<SpotPositionRouteDependencies> = {}): SpotPositionRouteDependencies {
   const riskState = defaultRiskState(now);
-  riskState.strategies.stablecoin.enabled = true;
-  riskState.strategies.stablecoin.readiness = {
+  riskState.strategies.imbalance.enabled = true;
+  riskState.strategies.imbalance.readiness = {
     positionStateReady: true,
     recoveryReady: true,
     executionAdapterReady: true
@@ -127,6 +131,7 @@ function dependencies(overrides: Partial<SpotPositionRouteDependencies> = {}): S
       getOrderStatus: async () => { throw new Error("unused"); },
       cancelOrder: async () => { throw new Error("unused"); }
     }),
+    getAvailableToman: async () => new Decimal(1_000_000),
     scan: () => [signal],
     createPlan: () => plan(),
     acquireLease: async () => ({ acquired: true, lease: lease("execution") }),
@@ -150,7 +155,7 @@ function dependencies(overrides: Partial<SpotPositionRouteDependencies> = {}): S
       dailyLossBreached: false,
       globalBlockers: [],
       strategies: {
-        triangle: status(), crossQuote: status(), pairs: status(), stablecoin: status(), gapTrading: status(), imbalance: status()
+        triangle: status(), gapTrading: status(), imbalance: status(), aiAgent: status()
       }
     }),
     emergencyStop: async () => riskState,
@@ -173,7 +178,7 @@ function lease(purpose: "execution") {
   return {
     version: 1 as const,
     slot: 0,
-    strategy: "stablecoin" as const,
+    strategy: "imbalance" as const,
     purpose,
     owner: "test",
     token: "00000000-0000-4000-8000-000000000001",
@@ -200,7 +205,7 @@ function order(id: string, amount: Decimal.Value, price: Decimal.Value): Nobitex
 function leg(stage: "entry" | "exit", side: "BUY" | "SELL", amount: Decimal.Value, input: Decimal.Value, output: Decimal.Value): SpotPositionExecutionLeg {
   return {
     stage,
-    symbol: "USDCIRT",
+    symbol: "XIRT",
     side,
     orderId: `${stage}-exchange-id`,
     clientOrderId: `${stage}-client-id`,
@@ -209,11 +214,11 @@ function leg(stage: "entry" | "exit", side: "BUY" | "SELL", amount: Decimal.Valu
     matchedAmountBase: new Decimal(amount),
     unmatchedAmountBase: new Decimal(0),
     actualInput: new Decimal(input),
-    inputAsset: side === "BUY" ? "IRT" : "USDC",
+    inputAsset: side === "BUY" ? "IRT" : "X",
     actualOutput: new Decimal(output),
-    outputAsset: side === "BUY" ? "USDC" : "IRT",
+    outputAsset: side === "BUY" ? "X" : "IRT",
     fee: new Decimal(0),
-    feeAsset: side === "BUY" ? "USDC" : "IRT",
+    feeAsset: side === "BUY" ? "X" : "IRT",
     averagePrice: new Decimal(side === "BUY" ? 91 : 101),
     fullFill: true
   };
@@ -235,17 +240,17 @@ function completed(p: SpotPositionExecutionPlan): SpotPositionExecutionResult {
   };
 }
 
-describe("Stablecoin/Imbalance route safety contract", () => {
+describe("Orderbook Imbalance route safety contract", () => {
   test("rejects foreign origin and browser-supplied capital", async () => {
-    expect((await handleSpotPositionRequest(request({ signalId: signal.id }, "execute", "https://evil.example"), "stablecoin", dependencies())).status).toBe(403);
-    const response = await handleSpotPositionRequest(request({ signalId: signal.id, capitalToman: 1 }), "stablecoin", dependencies());
+    expect((await handleSpotPositionRequest(request({ signalId: signal.id }, "execute", "https://evil.example"), "orderbook-imbalance", dependencies())).status).toBe(403);
+    const response = await handleSpotPositionRequest(request({ signalId: signal.id, capitalToman: 1 }), "orderbook-imbalance", dependencies());
     expect(response.status).toBe(400);
     expect((await response.json()).error).toContain("only signalId");
   });
 
   test("blocks non-Mainnet environments before settings, scans, leases or exchange reads", async () => {
     const calls = { settings: 0, reads: 0, lease: 0 };
-    const response = await handleSpotPositionRequest(request({ signalId: signal.id }), "stablecoin", dependencies({
+    const response = await handleSpotPositionRequest(request({ signalId: signal.id }), "orderbook-imbalance", dependencies({
       apiBaseUrl: () => "https://example.invalid",
       getSettings: async () => { calls.settings += 1; return settings; },
       createClient: () => ({
@@ -262,7 +267,7 @@ describe("Stablecoin/Imbalance route safety contract", () => {
 
   test("rescans by signalId and rejects a stale/non-actionable signal before a lease", async () => {
     let leases = 0;
-    const response = await handleSpotPositionRequest(request({ signalId: signal.id }), "stablecoin", dependencies({
+    const response = await handleSpotPositionRequest(request({ signalId: signal.id }), "orderbook-imbalance", dependencies({
       scan: () => [],
       acquireLease: async () => { leases += 1; return { acquired: true, lease: lease("execution") }; }
     }));
@@ -270,18 +275,62 @@ describe("Stablecoin/Imbalance route safety contract", () => {
     expect(leases).toBe(0);
   });
 
+  test("caps entry capital by strategy, global trade limit and usable free Spot IRT", async () => {
+    const cappedSettings = {
+      ...settings,
+      maxTradeToman: 80_000,
+      balanceUsagePercent: 25,
+      strategyLab: {
+        ...settings.strategyLab,
+        imbalance: { ...settings.strategyLab.imbalance, capitalToman: 100_000 }
+      }
+    };
+    let scanCapital = 0;
+    let planCapital = 0;
+    let recordedCapital = 0;
+    const response = await handleSpotPositionRequest(request({ signalId: signal.id }), "orderbook-imbalance", dependencies({
+      getSettings: async () => cappedSettings,
+      // 25% of 200,000 = 50,000, which is below both configured caps.
+      getAvailableToman: async () => new Decimal(200_000),
+      scan: (_kind, _books, receivedSettings) => {
+        scanCapital = receivedSettings.strategyLab.imbalance.capitalToman;
+        return [signal];
+      },
+      createPlan: (_kind, _signal, receivedSettings) => {
+        planCapital = receivedSettings.strategyLab.imbalance.capitalToman;
+        return plan(planCapital);
+      },
+      createExecution: async input => {
+        recordedCapital = input.requestedCapitalToman ?? 0;
+        return { id: 9 } as never;
+      }
+    }));
+
+    expect(response.status).toBe(200);
+    expect({ scanCapital, planCapital, recordedCapital }).toEqual({
+      scanCapital: 50_000,
+      planCapital: 50_000,
+      recordedCapital: 50_000
+    });
+  });
+
   test("persists entry/position/exit lifecycle and both client/exchange order ids", async () => {
     const transitions: string[] = [];
     const storedOrders: Array<Record<string, unknown>> = [];
+    let pnlIdempotencyKey = "";
     let released = 0;
-    const response = await handleSpotPositionRequest(request({ signalId: signal.id }), "stablecoin", dependencies({
+    const response = await handleSpotPositionRequest(request({ signalId: signal.id }), "orderbook-imbalance", dependencies({
       transitionExecution: async (_id, state) => { transitions.push(state); return { id: 9 } as never; },
       addOrder: async (_id, value) => { storedOrders.push(value as unknown as Record<string, unknown>); return { id: storedOrders.length } as never; },
       completeExecution: async () => { transitions.push("CLOSED"); return { id: 9 } as never; },
+      recordPnl: async (_pnl, _at, idempotency) => {
+        pnlIdempotencyKey = typeof idempotency === "object" ? idempotency.idempotencyKey ?? "" : "";
+        return defaultRiskState(now);
+      },
       releaseLease: async () => { released += 1; return true; },
       execute: async (p, _client, hooks) => {
         const validation = revalidateSpotPositionEntry(p, books, now);
-        const entryRequest: SpotPositionOrderRequest = { side: "BUY", base: "USDC", quote: "IRT", amountBase: new Decimal(1_000), expectedPrice: new Decimal(91), clientOrderId: "entry-client-id" };
+        const entryRequest: SpotPositionOrderRequest = { side: "BUY", base: "X", quote: "IRT", amountBase: new Decimal(1_000), expectedPrice: new Decimal(100), clientOrderId: "entry-client-id" };
         const entryOrder = order("entry-exchange-id", 1_000, 91);
         const entryLeg = leg("entry", "BUY", 1_000, 91_000, 1_000);
         await hooks.onBeforeOrder?.({ stage: "entry", plan: p, quote: validation.entryQuote, request: entryRequest });
@@ -289,8 +338,8 @@ describe("Stablecoin/Imbalance route safety contract", () => {
         await hooks.onOrderFinalized?.({ stage: "entry", plan: p, leg: entryLeg });
         await hooks.onPositionOpened?.({ plan: p, entry: entryLeg });
         await hooks.onPositionCheck?.({ plan: p, heldMs: 1_000 });
-        const exitQuote = quoteEdge({ id: "USDCIRT:SELL", from: "USDC", to: "IRT", side: "SELL", book: books[0]! }, 1_000, 0, 0, 100)!;
-        const exitRequest: SpotPositionOrderRequest = { side: "SELL", base: "USDC", quote: "IRT", amountBase: new Decimal(1_000), expectedPrice: new Decimal(101), clientOrderId: "exit-client-id" };
+        const exitQuote = quoteEdge({ id: "XIRT:SELL", from: "X", to: "IRT", side: "SELL", book: books[0]! }, 1_000, 0, 0, 100)!;
+        const exitRequest: SpotPositionOrderRequest = { side: "SELL", base: "X", quote: "IRT", amountBase: new Decimal(1_000), expectedPrice: new Decimal(99), clientOrderId: "exit-client-id" };
         const exitOrder = order("exit-exchange-id", 1_000, 101);
         const exitLeg = leg("exit", "SELL", 1_000, 1_000, 101_000);
         await hooks.onBeforeOrder?.({ stage: "exit", plan: p, quote: exitQuote, request: exitRequest });
@@ -300,10 +349,11 @@ describe("Stablecoin/Imbalance route safety contract", () => {
       }
     }));
     expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ status: "completed", strategy: "stablecoin", pnlRecordedGlobally: true });
+    expect(await response.json()).toMatchObject({ status: "completed", strategy: "imbalance", pnlRecordedGlobally: true });
     expect(transitions).toEqual(["REVALIDATING", "SUBMITTING", "HEDGING", "CLOSED"]);
     expect(storedOrders.some(value => value.clientOrderId === "entry-client-id" && value.exchangeOrderId === "entry-exchange-id")).toBe(true);
     expect(storedOrders.some(value => value.clientOrderId === "exit-client-id" && value.exchangeOrderId === "exit-exchange-id")).toBe(true);
+    expect(pnlIdempotencyKey).toBe("spot:9:pnl");
     expect(released).toBe(1);
   });
 
@@ -311,10 +361,10 @@ describe("Stablecoin/Imbalance route safety contract", () => {
     let emergency = 0;
     let failed = 0;
     let released = 0;
-    const response = await handleSpotPositionRequest(request({ signalId: signal.id }), "stablecoin", dependencies({
+    const response = await handleSpotPositionRequest(request({ signalId: signal.id }), "orderbook-imbalance", dependencies({
       execute: async (p, _client, hooks) => {
         const validation = revalidateSpotPositionEntry(p, books, now);
-        const request: SpotPositionOrderRequest = { side: "BUY", base: "USDC", quote: "IRT", amountBase: new Decimal(1_000), expectedPrice: new Decimal(91), clientOrderId: "ambiguous" };
+        const request: SpotPositionOrderRequest = { side: "BUY", base: "X", quote: "IRT", amountBase: new Decimal(1_000), expectedPrice: new Decimal(100), clientOrderId: "ambiguous" };
         await hooks.onBeforeOrder?.({ stage: "entry", plan: p, quote: validation.entryQuote, request });
         await hooks.onOrderSubmitted?.({ stage: "entry", plan: p, order: order("maybe-filled", 1_000, 91), request });
         throw new SpotPositionExecutionError("unknown final order state", "ORDER_STATE_UNKNOWN", true);
@@ -330,7 +380,7 @@ describe("Stablecoin/Imbalance route safety contract", () => {
 
   test("a valuable untradable residual never closes the record or records false realized PnL", async () => {
     const calls = { completed: 0, pnl: 0, failed: 0, emergency: 0 };
-    const response = await handleSpotPositionRequest(request({ signalId: signal.id }), "stablecoin", dependencies({
+    const response = await handleSpotPositionRequest(request({ signalId: signal.id }), "orderbook-imbalance", dependencies({
       execute: async (p, _client, hooks) => {
         const entryLeg = leg("entry", "BUY", 1_000, 91_000, 999.995);
         await hooks.onPositionOpened?.({ plan: p, entry: entryLeg });
@@ -355,10 +405,10 @@ describe("Stablecoin/Imbalance route safety contract", () => {
     let failed = 0;
     let emergency = 0;
     const transitions: string[] = [];
-    const response = await handleSpotPositionRequest(request({ signalId: signal.id }), "stablecoin", dependencies({
+    const response = await handleSpotPositionRequest(request({ signalId: signal.id }), "orderbook-imbalance", dependencies({
       execute: async (p, _client, hooks) => {
         const validation = revalidateSpotPositionEntry(p, books, now);
-        const entryRequest: SpotPositionOrderRequest = { side: "BUY", base: "USDC", quote: "IRT", amountBase: new Decimal(1_000), expectedPrice: new Decimal(91), clientOrderId: "known-entry" };
+        const entryRequest: SpotPositionOrderRequest = { side: "BUY", base: "X", quote: "IRT", amountBase: new Decimal(1_000), expectedPrice: new Decimal(100), clientOrderId: "known-entry" };
         await hooks.onBeforeOrder?.({ stage: "entry", plan: p, quote: validation.entryQuote, request: entryRequest });
         await hooks.onOrderSubmitted?.({ stage: "entry", plan: p, order: order("known-filled", 1_000, 91), request: entryRequest });
         throw new SpotPositionExecutionError("temporary recovery depth gap", "RECOVERY_FAILED", true);
@@ -379,21 +429,22 @@ describe("Stablecoin/Imbalance route safety contract", () => {
     let entryLeases = 0;
     let recoveryLeases = 0;
     let recoveredAmount = "";
+    let pnlIdempotencyKey = "";
     const activeRecord = {
       id: 41,
-      strategy: "stablecoin",
+      strategy: "imbalance",
       signalId: signal.id,
       state: "HEDGING",
       symbols: signal.symbols,
       direction: "IRT -> asset -> IRT (long Spot)",
       metadata: { executionPlan: serializeSpotPositionExecutionPlan(plan()) },
       orders: [{
-        id: 1, executionId: 41, legIndex: 0, symbol: "USDCIRT", side: "BUY", orderType: "MARKET", status: "Done",
+        id: 1, executionId: 41, legIndex: 0, symbol: "XIRT", side: "BUY", orderType: "MARKET", status: "Done",
         clientOrderId: "entry-client", exchangeOrderId: "entry-exchange", requestedAmount: "1000", filledAmount: "1000",
-        averagePrice: "91", fee: "0", inputAsset: "IRT", outputAsset: "USDC", raw: {}, createdAt: now
+        averagePrice: "100", fee: "0", inputAsset: "IRT", outputAsset: "X", raw: {}, createdAt: now
       }]
     };
-    const response = await handleSpotPositionRecoveryRequest(request({ signalId: signal.id }, "recover"), "stablecoin", dependencies({
+    const response = await handleSpotPositionRecoveryRequest(request({ signalId: signal.id }, "recover"), "orderbook-imbalance", dependencies({
       listExecutions: async () => ({ records: [activeRecord] }) as never,
       acquireLease: async () => { entryLeases += 1; return { acquired: true, lease: lease("execution") }; },
       acquireRecoveryLease: async () => {
@@ -413,10 +464,14 @@ describe("Stablecoin/Imbalance route safety contract", () => {
       }),
       transitionExecution: async (_id, state) => { transitions.push(state); return { id: 41 } as never; },
       completeExecution: async () => { transitions.push("CLOSED"); return { id: 41 } as never; },
+      recordPnl: async (_pnl, _at, idempotency) => {
+        pnlIdempotencyKey = typeof idempotency === "object" ? idempotency.idempotencyKey ?? "" : "";
+        return defaultRiskState(now);
+      },
       recover: async (p, amount, _client, hooks) => {
         recoveredAmount = new Decimal(amount).toString();
-        const quote = quoteEdge({ id: "USDCIRT:SELL", from: "USDC", to: "IRT", side: "SELL", book: books[0]! }, amount, 0, 0, 100)!;
-        const recoveryRequest: SpotPositionOrderRequest = { side: "SELL", base: "USDC", quote: "IRT", amountBase: new Decimal(amount), expectedPrice: new Decimal(90), clientOrderId: "recovery-client" };
+        const quote = quoteEdge({ id: "XIRT:SELL", from: "X", to: "IRT", side: "SELL", book: books[0]! }, amount, 0, 0, 100)!;
+        const recoveryRequest: SpotPositionOrderRequest = { side: "SELL", base: "X", quote: "IRT", amountBase: new Decimal(amount), expectedPrice: new Decimal(99), clientOrderId: "recovery-client" };
         const recoveryOrder = order("recovery-exchange", amount, 90);
         const recoveryLeg = { ...leg("exit", "SELL", amount, amount, new Decimal(amount).mul(90)), stage: "recovery" as const, orderId: "recovery-exchange", clientOrderId: "recovery-client" };
         await hooks.onBeforeOrder?.({ stage: "recovery", plan: p, quote, request: recoveryRequest });
@@ -430,7 +485,50 @@ describe("Stablecoin/Imbalance route safety contract", () => {
     expect(entryLeases).toBe(0);
     expect(recoveryLeases).toBe(1);
     expect(recoveredAmount).toBe("1000");
+    expect(pnlIdempotencyKey).toBe("spot:41:pnl");
     expect(transitions).toEqual(["RECOVERING", "CLOSED"]);
+  });
+
+  test("already-flat recovery records PnL once under the persisted execution key", async () => {
+    let recoveryOrders = 0;
+    let pnlIdempotencyKey = "";
+    const activeRecord = {
+      id: 46,
+      strategy: "imbalance",
+      signalId: signal.id,
+      state: "HEDGING",
+      symbols: signal.symbols,
+      direction: "IRT -> asset -> IRT (long Spot)",
+      metadata: { executionPlan: serializeSpotPositionExecutionPlan(plan()) },
+      orders: [
+        { clientOrderId: "flat-entry-client", exchangeOrderId: "flat-entry", side: "BUY" },
+        { clientOrderId: "flat-exit-client", exchangeOrderId: "flat-exit", side: "SELL" }
+      ]
+    };
+    const response = await handleSpotPositionRecoveryRequest(request({ signalId: signal.id }, "recover"), "orderbook-imbalance", dependencies({
+      listExecutions: async () => ({ records: [activeRecord] }) as never,
+      createClient: () => ({
+        baseUrl: "https://apiv2.nobitex.ir",
+        getAllOrderBooks: async () => books,
+        getMarketOptions: async () => { throw new Error("unused"); },
+        placeMarketOrder: async () => { throw new Error("unused"); },
+        getOrderStatus: async id => order(id, 1_000, id === "flat-entry" ? 91 : 101),
+        cancelOrder: async () => { throw new Error("terminal orders must not be canceled"); }
+      }),
+      recover: async () => {
+        recoveryOrders += 1;
+        throw new Error("an already-flat position must not submit another SELL");
+      },
+      recordPnl: async (_pnl, _at, idempotency) => {
+        pnlIdempotencyKey = typeof idempotency === "object" ? idempotency.idempotencyKey ?? "" : "";
+        return defaultRiskState(now);
+      }
+    }));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ status: "already-flat", executionId: 46, exposureAmount: "0" });
+    expect(recoveryOrders).toBe(0);
+    expect(pnlIdempotencyKey).toBe("spot:46:pnl");
   });
 
   test("restart recovery never guesses exposure when a client id has no exchange order id", async () => {
@@ -438,7 +536,7 @@ describe("Stablecoin/Imbalance route safety contract", () => {
     let emergency = 0;
     const activeRecord = {
       id: 42,
-      strategy: "stablecoin",
+      strategy: "imbalance",
       signalId: signal.id,
       state: "SUBMITTING",
       symbols: signal.symbols,
@@ -446,7 +544,7 @@ describe("Stablecoin/Imbalance route safety contract", () => {
       metadata: { executionPlan: serializeSpotPositionExecutionPlan(plan()) },
       orders: [{ clientOrderId: "ambiguous-client", exchangeOrderId: null, side: "BUY" }]
     };
-    const response = await handleSpotPositionRecoveryRequest(request({ signalId: signal.id }, "recover"), "stablecoin", dependencies({
+    const response = await handleSpotPositionRecoveryRequest(request({ signalId: signal.id }, "recover"), "orderbook-imbalance", dependencies({
       listExecutions: async () => ({ records: [activeRecord] }) as never,
       recover: async () => { recoveryOrders += 1; throw new Error("must not recover"); },
       emergencyStop: async () => { emergency += 1; return defaultRiskState(now); }
@@ -461,7 +559,7 @@ describe("Stablecoin/Imbalance route safety contract", () => {
     let recoveredAmount = "";
     const activeRecord = {
       id: 45,
-      strategy: "stablecoin",
+      strategy: "imbalance",
       signalId: signal.id,
       state: "SUBMITTING",
       symbols: signal.symbols,
@@ -469,7 +567,7 @@ describe("Stablecoin/Imbalance route safety contract", () => {
       metadata: { executionPlan: serializeSpotPositionExecutionPlan(plan()) },
       orders: [{ clientOrderId: "accepted-after-timeout", exchangeOrderId: null, side: "BUY" }]
     };
-    const response = await handleSpotPositionRecoveryRequest(request({ signalId: signal.id }, "recover"), "stablecoin", dependencies({
+    const response = await handleSpotPositionRecoveryRequest(request({ signalId: signal.id }, "recover"), "orderbook-imbalance", dependencies({
       listExecutions: async () => ({ records: [activeRecord] }) as never,
       createClient: () => ({
         baseUrl: "https://apiv2.nobitex.ir",
@@ -507,7 +605,7 @@ describe("Stablecoin/Imbalance route safety contract", () => {
     let recoveryLeases = 0;
     const activeRecord = {
       id: 43,
-      strategy: "stablecoin",
+      strategy: "imbalance",
       signalId: signal.id,
       state: "HEDGING",
       symbols: signal.symbols,
@@ -515,7 +613,7 @@ describe("Stablecoin/Imbalance route safety contract", () => {
       metadata: { executionPlan: serializeSpotPositionExecutionPlan(plan()) },
       orders: []
     };
-    const response = await handleSpotPositionRecoveryRequest(request({ signalId: signal.id }, "recover"), "stablecoin", dependencies({
+    const response = await handleSpotPositionRecoveryRequest(request({ signalId: signal.id }, "recover"), "orderbook-imbalance", dependencies({
       listExecutions: async () => ({ records: [activeRecord] }) as never,
       acquireRecordLock: async () => ({ acquired: false }),
       acquireRecoveryLease: async () => {
@@ -533,7 +631,7 @@ describe("Stablecoin/Imbalance route safety contract", () => {
     let emergency = 0;
     const activeRecord = {
       id: 44,
-      strategy: "stablecoin",
+      strategy: "imbalance",
       signalId: signal.id,
       state: "HEDGING",
       symbols: signal.symbols,
@@ -541,7 +639,7 @@ describe("Stablecoin/Imbalance route safety contract", () => {
       metadata: { executionPlan: serializeSpotPositionExecutionPlan(plan()) },
       orders: [{ clientOrderId: "entry-client", exchangeOrderId: "entry-exchange", side: "BUY" }]
     };
-    const response = await handleSpotPositionRecoveryRequest(request({ signalId: signal.id }, "recover"), "stablecoin", dependencies({
+    const response = await handleSpotPositionRecoveryRequest(request({ signalId: signal.id }, "recover"), "orderbook-imbalance", dependencies({
       listExecutions: async () => ({ records: [activeRecord] }) as never,
       createClient: () => ({
         baseUrl: "https://apiv2.nobitex.ir",

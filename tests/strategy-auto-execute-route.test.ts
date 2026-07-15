@@ -29,18 +29,18 @@ describe("automatic strategy execution route", () => {
   });
 
   test("rejects foreign origins and unknown engines", async () => {
-    expect((await POST(dashboardRequest({ kind: "stablecoin", signalId: "stablecoin:USDC" }, "https://attacker.example"))).status).toBe(403);
+    expect((await POST(dashboardRequest({ kind: "orderbook-imbalance", signalId: "imbalance:XIRT" }, "https://attacker.example"))).status).toBe(403);
     expect((await POST(dashboardRequest({ kind: "market-making", signalId: "maker:BTCIRT" }))).status).toBe(400);
     // Gap is a supported engine; without a current calibrated signal it is
     // safely rejected by its fresh server-side scan before any order.
     expect((await POST(dashboardRequest({ kind: "orderbook-gap", signalId: "gap:BTCIRT:ask:1" }))).status).toBe(409);
   });
 
-  test("skips a recently completed stable signal before any exchange work", async () => {
+  test("skips a recently completed signal before any exchange work", async () => {
     const now = Date.now();
     const record = await createStrategyExecution({
-      strategy: "stablecoin",
-      signalId: "stablecoin:USDC",
+      strategy: "imbalance",
+      signalId: "imbalance:XIRT",
       symbols: ["USDCIRT", "USDTIRT"],
       direction: "LONG",
       detectedAt: now
@@ -49,7 +49,7 @@ describe("automatic strategy execution route", () => {
     await transitionStrategyExecution(record.id, "SUBMITTING", { at: now + 2 });
     await completeStrategyExecution(record.id, { at: now + 3 });
 
-    const response = await POST(dashboardRequest({ kind: "stablecoin", signalId: "stablecoin:USDC" }));
+    const response = await POST(dashboardRequest({ kind: "orderbook-imbalance", signalId: "imbalance:XIRT" }));
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({
       status: "skipped",

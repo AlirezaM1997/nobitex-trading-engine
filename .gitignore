@@ -13,3 +13,8 @@ data/risk-state.json
 data/risk-state.json.*
 data/risk-execution.*.lock
 data/pairs-short-asset.*.lock
+data/ai-agent-state.json
+data/ai-agent-state.json.*
+data/ai-models/
+data/ai-datasets/
+data/ai-training-jobs.json

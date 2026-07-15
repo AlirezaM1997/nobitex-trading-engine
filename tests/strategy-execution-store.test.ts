@@ -11,7 +11,7 @@ describe("strategy execution state store", () => {
 
   test("persists the complete execution, order and transition audit trail", async () => {
     const created = await store.createStrategyExecution({
-      strategy: "cross-quote-inventory",
+      strategy: "audit-test-engine",
       signalId: "signal-1",
       symbols: ["BTCIRT", "BTCUSDT", "USDTIRT"],
       direction: "IRT_TO_USDT",
@@ -140,16 +140,16 @@ describe("strategy execution state store", () => {
 
   test("finds active duplicates and applies a terminal execution cooldown", async () => {
     const execution = await store.createStrategyExecution({
-      strategy: "stablecoin",
-      signalId: "stablecoin:USDC",
-      symbols: ["USDCIRT", "USDTIRT"],
+      strategy: "imbalance",
+      signalId: "imbalance:USDCIRT",
+      symbols: ["USDCIRT"],
       direction: "LONG",
       detectedAt: 1_000
     });
 
     expect((await store.findRecentStrategyExecution({
-      strategy: "stablecoin",
-      signalId: "stablecoin:USDC",
+      strategy: "imbalance",
+      signalId: "imbalance:USDCIRT",
       since: 2_000
     }))?.id).toBe(execution.id);
 
@@ -158,13 +158,13 @@ describe("strategy execution state store", () => {
     await store.completeStrategyExecution(execution.id, { at: 1_300 });
 
     expect(await store.findRecentStrategyExecution({
-      strategy: "stablecoin",
-      signalId: "stablecoin:USDC",
+      strategy: "imbalance",
+      signalId: "imbalance:USDCIRT",
       since: 1_301
     })).toBeUndefined();
     expect((await store.findRecentStrategyExecution({
-      strategy: "stablecoin",
-      signalId: "stablecoin:USDC",
+      strategy: "imbalance",
+      signalId: "imbalance:USDCIRT",
       since: 1_299
     }))?.state).toBe("CLOSED");
   });
@@ -196,7 +196,7 @@ describe("strategy execution state store", () => {
 
   test("dashboard cleanup removes final and pre-order history but preserves exchange-facing records", async () => {
     const closed = await store.createStrategyExecution({
-      strategy: "stablecoin",
+      strategy: "imbalance",
       signalId: "closed-signal",
       symbols: ["USDCIRT"],
       direction: "LONG"
@@ -244,7 +244,7 @@ describe("strategy execution state store", () => {
     });
 
     const active = await store.createStrategyExecution({
-      strategy: "pairs",
+      strategy: "imbalance",
       signalId: "active-signal",
       symbols: ["BTCIRT", "ETHIRT"],
       direction: "HEDGED"
@@ -267,5 +267,19 @@ describe("strategy execution state store", () => {
     expect(history.summary.closedCount).toBe(0);
     expect(history.summary.activeCount).toBe(1);
     expect(history.summary.failedManualCount).toBe(1);
+  });
+
+  test("administrative purge removes executions, orders and transitions", async () => {
+    const created = await store.createStrategyExecution({
+      strategy: "imbalance",
+      symbols: ["USDCIRT"],
+      direction: "LONG",
+      detectedAt: 10_000
+    });
+    await store.transitionStrategyExecution(created.id, "REVALIDATING", { at: 10_100 });
+    const deleted = await store.purgeAllStrategyExecutionData();
+    expect(deleted.executions).toBe(1);
+    expect(deleted.transitions).toBe(2);
+    expect((await store.listStrategyExecutions()).summary.totalCount).toBe(0);
   });
 });
